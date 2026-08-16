@@ -1,0 +1,95 @@
+# wings-rs daemon configuration.
+# Drop-in compatible with the config.yml that the Pterodactyl panel
+# generates for a node (Settings > Nodes > edit node). You can paste the
+# panel-generated file here, or use this example as a starting point.
+debug: false
+app_name: Pterodactyl
+uuid: ""
+token_id: ""
+token: "replace-with-your-daemon-token"
+
+api:
+  host: 0.0.0.0
+  port: 8080
+  ssl:
+    enabled: false
+    cert: ""
+    key: ""
+  disable_remote_download: false
+  upload_limit: 100
+  trusted_proxies: []
+
+system:
+  root_directory: /var/lib/pterodactyl
+  log_directory: /var/log/pterodactyl
+  data: /var/lib/pterodactyl/volumes
+  archive_directory: /var/lib/pterodactyl/archives
+  backup_directory: /var/lib/pterodactyl/backups
+  tmp_directory: /tmp/pterodactyl
+  username: pterodactyl
+  timezone: UTC
+  disk_check_interval: 150
+  websocket_log_count: 150
+  check_permissions_on_boot: true
+  sftp:
+    bind_address: 0.0.0.0
+    bind_port: 2022
+    read_only: false
+  crash_detection:
+    enabled: true
+    detect_clean_exit_as_crash: true
+    timeout: 60
+
+docker:
+  network:
+    interface: 172.18.0.1
+    dns: [1.1.1.1, 1.0.0.1]
+    name: pterodactyl_nw
+    ispn: false
+    driver: bridge
+    network_mode: pterodactyl_nw
+    is_internal: false
+    enable_icc: true
+    network_mtu: 1500
+    interfaces:
+      v4:
+        subnet: 172.18.0.0/16
+        gateway: 172.18.0.1
+      v6:
+        subnet: fdba:17c8:6c94::/64
+        gateway: fdba:17c8:6c94::1011
+  domainname: ""
+  registries: []
+  tmpfs_size: 100
+  container_pid_limit: 512
+  installer_limits:
+    memory: 1024
+    cpu: 100
+  cpu_period: 100000
+  cpu_shares: 0
+  overhead:
+    override_multiplier: false
+    default_multiplier: 1.05
+    multipliers:
+      - memory: 2048
+        overhead: 1.15
+      - memory: 4096
+        overhead: 1.10
+  userns_mode: ""
+  log_config:
+    type: local
+    config:
+      max-size: 5m
+      max-file: "1"
+      compress: "false"
+      mode: non-blocking
+
+remote: https://panel.example.com
+remote_query:
+  timeout: 30
+  boot_servers_per_page: 50
+
+allowed_mounts: []
+allowed_origins: []
+allow_cors_private_network: false
+ignore_panel_config_updates: false
