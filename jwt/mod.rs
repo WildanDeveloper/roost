@@ -20,6 +20,7 @@ pub struct Claims {
     pub server_uuid: Option<String>,
     pub user_uuid: Option<String>,
     pub unique_id: Option<String>,
+    pub jti: Option<String>,
     pub backup_uuid: Option<String>,
     pub iss: Option<String>,
     pub iat: Option<i64>,
@@ -33,10 +34,11 @@ impl Claims {
     }
 
     pub fn has_permission(&self, perm: &str) -> bool {
-        self.permissions
-            .as_deref()
-            .map(|perms| perms.iter().any(|p| p == perm))
-            .unwrap_or(false)
+        self.permissions.as_deref().map_or(false, |perms| {
+            perms.iter().any(|p| {
+                p == perm || (!perm.starts_with("admin") && p == "*")
+            })
+        })
     }
 
     /// The server this JWT is bound to (ws console/download/upload).
@@ -82,6 +84,7 @@ pub async fn parse_token(
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.leeway = 0;
     validation.validate_exp = true;
+    validation.validate_aud = false;
     validation.required_spec_claims = std::collections::HashSet::new();
 
     let data = decode::<Claims>(token, &key, &validation).map_err(|e| {
@@ -92,15 +95,35 @@ pub async fn parse_token(
 
     let claims = data.claims;
 
-    if claims.iat.map(|iat| iat < boot_time).unwrap_or(false) {
-        return Err(AppError::Unauthorized("jwt issued before daemon boot".to_string()));
+    // Revocation checks mirror wings isDenylisted: only tokens that carry
+    // both server_uuid and user_uuid (websocket/file/backup) are checked;
+    // transfer tokens (sub + scope only) are not.
+    let iat = claims.iat;
+    let su = claims.server_uuid();
+    let uu = claims.user_uuid.as_deref();
+    if let (Some(iat), Some(_su), Some(uu)) = (iat, su, uu) {
+        if iat < boot_time {
+            return Err(AppError::Unauthorized("jwt created too far in past (denylist)".to_string()));
+        }
+        if let Some(jti) = &claims.jti {
+            if tokens.is_jti_denied(jti, iat) {
+                return Err(AppError::Unauthorized("jwt token was revoked".to_string()));
+            }
+        }
+        if tokens.is_user_denied(uu, iat) {
+            return Err(AppError::Unauthorized("jwt token was revoked".to_string()));
+        }
     }
 
     // Single-use tokens (download/upload/backup) carry a unique_id; the
-    // first use claims it, everything after is rejected.
-    if let Some(id) = &claims.unique_id {
-        if !tokens.claim(id).await {
-            return Err(AppError::Unauthorized("jwt token was revoked".to_string()));
+    // first use claims it, everything after is rejected. Websocket tokens
+    // also carry a unique_id but are re-validated on every message, so they
+    // must NOT be single-use (mirrors wings).
+    if claims.scope.as_deref() != Some("websocket") {
+        if let Some(id) = &claims.unique_id {
+            if !tokens.claim(id).await {
+                return Err(AppError::Unauthorized("jwt token was revoked".to_string()));
+            }
         }
     }
 

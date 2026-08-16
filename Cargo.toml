@@ -3,6 +3,11 @@ name = "roost"
 version = "0.1.0"
 edition = "2021"
 description = "Pterodactyl Wings-compatible daemon written in Rust"
+autobins = false
+
+[[bin]]
+name = "roost"
+path = "main.rs"
 
 [dependencies]
 # --- Async runtime ---
@@ -11,7 +16,8 @@ tokio = { version = "1", features = ["full"] }
 # --- HTTP + WebSocket server ---
 axum = { version = "0.7", features = ["ws", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower = "0.4"
+rustls = { version = "0.23", features = ["ring"] }
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace"] }
 
 # --- Docker API client ---
@@ -19,7 +25,7 @@ bollard = "0.16"
 futures-util = "0.3"
 
 # --- HTTP client ke Panel (wings -> panel) ---
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
 # --- Serialization ---
 serde = { version = "1", features = ["derive"] }

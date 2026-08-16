@@ -86,6 +86,7 @@ impl Server {
         let normalized = script.script.replace("\r\n", "\n");
         std::fs::write(&script_path, normalized)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot write install script: {e}")))?;
+        tracing::info!(uuid = %self.uuid, path = %script_path.display(), "install script staged");
 
         // 3. Pull the installer image (fall back to local copy).
         if let Err(e) = self.docker.pull_image(&script.container_image, &daemon.docker).await {
@@ -94,11 +95,16 @@ impl Server {
 
         // 4. Recreate the installer container.
         let installer_name = format!("{}_installer", self.uuid);
+        tracing::info!(uuid = %self.uuid, "creating installer container");
         self.docker.remove(&installer_name).await?;
 
         let env = self.build_env().await;
         let network_ip = daemon.docker.network.interface.clone();
         let data_dir = self.fs.root().to_path_buf();
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create server data dir: {e}")))?;
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create install tmp dir: {e}")))?;
 
         self.docker
             .create_installer_container(
@@ -132,7 +138,9 @@ impl Server {
         }
 
         // 7. Start and wait for the container to stop.
+        tracing::info!(uuid = %self.uuid, "starting installer container");
         self.docker.start(&installer_name).await?;
+        tracing::info!(uuid = %self.uuid, "installer container started; waiting for exit");
 
         {
             use futures_util::StreamExt;
@@ -141,6 +149,7 @@ impl Server {
         }
 
         // 8. Cleanup.
+        tracing::info!(uuid = %self.uuid, "installer container finished; cleaning up");
         self.docker.remove(&installer_name).await?;
         let _ = std::fs::remove_dir_all(&tmp_dir);
 

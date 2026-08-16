@@ -34,12 +34,9 @@ impl ServerManager {
     }
 
     pub async fn get(&self, uuid: Uuid) -> AppResult<Arc<Server>> {
-        self.servers
-            .read()
-            .await
-            .get(&uuid)
-            .cloned()
-            .ok_or(AppError::ServerNotFound)
+        let map = self.servers.read().await;
+        tracing::debug!(uuid = %uuid, keys = map.len(), "manager get");
+        map.get(&uuid).cloned().ok_or(AppError::ServerNotFound)
     }
 
     pub async fn list(&self) -> Vec<Arc<Server>> {
@@ -128,12 +125,15 @@ impl ServerManager {
         let server = Arc::new(Server::new(data, &self.shared, data_dir));
         self.servers.write().await.insert(uuid, server.clone());
 
-        if start_on_completion {
-            let server = server.clone();
-            tokio::spawn(async move {
-                server.install(false).await;
-            });
-        }
+        // Mirrors wings: the install process always runs; start_on_completion
+        // only controls whether the server is started once it finishes.
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.install(false).await;
+            if start_on_completion {
+                let _ = server.power_start().await;
+            }
+        });
 
         Ok(())
     }

@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -10,6 +11,7 @@ pub struct ServerConfig {
     pub uuid: Uuid,
     pub meta: ServerMeta,
     pub suspended: bool,
+    #[serde(deserialize_with = "de_string_map")]
     pub environment: HashMap<String, String>,
     pub invocation: String,
     pub skip_egg_scripts: bool,
@@ -47,7 +49,7 @@ pub struct ServerBuild {
     /// %; 0 = unlimited
     pub cpu_limit: i64,
     /// cpuset, e.g. "0-3"; empty = all
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_nullable_string")]
     pub threads: String,
     /// MB
     pub disk_space: i64,
@@ -131,6 +133,7 @@ pub struct PatternConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternReplace {
+    #[serde(rename = "match")]
     pub match_: String,
     pub replace_with: String,
     #[serde(default)]
@@ -156,4 +159,31 @@ impl ServerConfig {
         }
         out
     }
+}
+fn de_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Option::<String>::deserialize(deserializer)?;
+    Ok(v.unwrap_or_default())
+}
+
+fn de_string_map<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = HashMap::<String, Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let s = match v {
+                Value::String(s) => s,
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            (k, s)
+        })
+        .collect())
 }

@@ -10,6 +10,10 @@ mod server;
 mod state;
 
 use std::net::SocketAddr;
+
+fn init_tls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -52,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("cannot build panel client: {e}"))?
     };
     let panel = Arc::new(RwLock::new(panel_client));
+
+    init_tls();
 
     let boot_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -51,13 +51,13 @@ impl Filesystem {
         &self.root
     }
 
-    /// Resolve a user-supplied relative path against the root. Returns
-    /// an error if the path escapes the root or is otherwise unsafe.
+    /// Resolve a user-supplied path against the root. Returns an error if
+    /// the path escapes the root or is otherwise unsafe. Absolute paths are
+    /// allowed but are treated as relative to the root, matching wings
+    /// (filepath.Join(base, strings.TrimPrefix(path, base))).
     pub fn resolve(&self, path: &str) -> AppResult<PathBuf> {
-        if path.starts_with('/') {
-            return Err(AppError::BadRequest("absolute paths are not allowed".into()));
-        }
-        let joined = self.root.join(path);
+        let cleaned = path.trim_start_matches('/');
+        let joined = self.root.join(cleaned);
         let components: Vec<Component> = joined.components().collect();
         if components.iter().any(|c| matches!(c, Component::ParentDir)) {
             return Err(AppError::BadRequest("path escapes the server directory".into()));

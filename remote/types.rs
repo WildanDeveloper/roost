@@ -8,7 +8,7 @@ use crate::models::{ProcessConfig, ServerConfig};
 pub struct RawServerData {
     pub uuid: Uuid,
     pub settings: ServerConfig,
-    pub process_configuration: ProcessConfig,
+    pub process_configuration: Option<ProcessConfig>,
 }
 
 /// Wrapper for the paginated server list from the panel.
@@ -22,12 +22,8 @@ pub struct ServerListResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerListMeta {
     #[serde(default)]
-    pub pagination: Option<Pagination>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pagination {
     pub current_page: u64,
+    #[serde(default)]
     pub last_page: u64,
 }
 
@@ -35,14 +31,14 @@ pub struct Pagination {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfigurationResponse {
     pub settings: ServerConfig,
-    pub process_configuration: ProcessConfig,
+    pub process_configuration: Option<ProcessConfig>,
 }
 
 /// `GET /api/remote/servers/{uuid}/install` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallScriptResponse {
     pub container_image: String,
-    pub entrypoint: Vec<String>,
+    pub entrypoint: String,
     pub script: String,
 }
 

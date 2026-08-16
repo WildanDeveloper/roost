@@ -105,6 +105,7 @@ pub async fn server_exists(
 
     if let Some(pos) = server_pos {
         if let Some(uuid_str) = segments.get(pos + 1) {
+            tracing::debug!(path = %req.uri(), uuid = %uuid_str, "server_exists middleware");
             if let Ok(uuid) = Uuid::parse_str(uuid_str) {
                 let server = state.manager.get(uuid).await?;
                 let mut req = req;

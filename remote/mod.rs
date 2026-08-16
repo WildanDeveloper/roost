@@ -22,6 +22,7 @@ pub struct PanelClient {
 impl PanelClient {
     pub fn new(panel_url: &str, token_id: &str, token: &str) -> anyhow::Result<Self> {
         let inner = reqwest::Client::builder()
+            .http1_only()
             .timeout(Duration::from_secs(15))
             .user_agent(format!("Pterodactyl Wings/v1.13.3 (id:{token_id})"))
             .build()?;
@@ -35,7 +36,7 @@ impl PanelClient {
     }
 
     fn auth_header(&self) -> String {
-        format!("{}.{}", self.token_id, self.token)
+        format!("Bearer {}.{}", self.token_id, self.token)
     }
 
     /// Reset installing/restoring states after a daemon boot.
@@ -55,18 +56,8 @@ impl PanelClient {
             let resp: types::ServerListResponse = self.request(reqwest::Method::GET, &url, None::<&()>).await?;
             servers.extend(resp.data);
 
-            let last = resp
-                .meta
-                .pagination
-                .as_ref()
-                .map(|p| p.last_page)
-                .unwrap_or(page as u64);
-            let current = resp
-                .meta
-                .pagination
-                .as_ref()
-                .map(|p| p.current_page)
-                .unwrap_or(page as u64);
+            let last = resp.meta.last_page.max(1);
+            let current = resp.meta.current_page.max(1);
 
             if current >= last || servers.is_empty() {
                 break;
@@ -181,11 +172,27 @@ pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::Bac
             match result {
                 Ok(resp) => {
                     let status = resp.status();
+                    if status == reqwest::StatusCode::NO_CONTENT {
+                        return serde_json::from_str("null").map_err(|e| {
+                            AppError::Remote(format!("bad panel response: {e}"))
+                        });
+                    }
                     if status.is_success() {
-                        return resp
-                            .json::<T>()
-                            .await
-                            .map_err(|e| AppError::Remote(format!("bad panel response: {e}")));
+                        let len = resp.content_length();
+                        let ct = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("?")
+                            .to_string();
+                        let text = resp.text().await.unwrap_or_default();
+                        tracing::debug!(path, status = %status, len, ct, body_len = text.len(), "panel response");
+                        return serde_json::from_str::<T>(&text).map_err(|e| {
+                            AppError::Remote(format!(
+                                "bad panel response: {e}; body: {}",
+                                &text[..text.len().min(4000)]
+                            ))
+                        });
                     }
                     if status.is_client_error() {
                         let text = resp.text().await.unwrap_or_default();

@@ -17,12 +17,12 @@ use crate::state::DaemonState;
 
 pub fn router() -> Router<DaemonState> {
     Router::new()
-        .route("/api/servers/{server}/backup", post(create_backup))
+        .route("/api/servers/:server/backup", post(create_backup))
         .route(
-            "/api/servers/{server}/backup/{backup}/restore",
+            "/api/servers/:server/backup/:backup/restore",
             post(restore_backup),
         )
-        .route("/api/servers/{server}/backup/{backup}", delete(delete_backup))
+        .route("/api/servers/:server/backup/:backup", delete(delete_backup))
 }
 
 #[derive(Debug, Deserialize)]

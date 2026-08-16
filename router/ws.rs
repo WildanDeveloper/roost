@@ -18,7 +18,7 @@ use crate::server::Server;
 use crate::state::DaemonState;
 
 pub fn router() -> Router<DaemonState> {
-    Router::new().route("/api/servers/{server}/ws", get(ws_route))
+    Router::new().route("/api/servers/:server/ws", get(ws_route))
 }
 
 /// JSON envelope used in both directions.
@@ -180,6 +180,10 @@ async fn handle_socket(mut socket: WebSocket, state: DaemonState, server: Arc<Se
                         let _ = socket.send(Message::Pong(Vec::new())).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "websocket recv error");
+                        break;
+                    }
                     _ => {}
                 }
             }

@@ -18,23 +18,23 @@ use crate::state::DaemonState;
 pub fn router() -> Router<DaemonState> {
     Router::new()
         .route(
-            "/api/servers/{server}/files/list-directory",
+            "/api/servers/:server/files/list-directory",
             get(list_directory),
         )
-        .route("/api/servers/{server}/files/contents", get(read_contents))
-        .route("/api/servers/{server}/files/rename", put(rename_files))
-        .route("/api/servers/{server}/files/copy", post(copy_file))
-        .route("/api/servers/{server}/files/write", post(write_file))
+        .route("/api/servers/:server/files/contents", get(read_contents))
+        .route("/api/servers/:server/files/rename", put(rename_files))
+        .route("/api/servers/:server/files/copy", post(copy_file))
+        .route("/api/servers/:server/files/write", post(write_file))
         .route(
-            "/api/servers/{server}/files/create-directory",
+            "/api/servers/:server/files/create-directory",
             post(create_directory),
         )
-        .route("/api/servers/{server}/files/delete", post(delete_files))
-        .route("/api/servers/{server}/files/compress", post(compress))
-        .route("/api/servers/{server}/files/decompress", post(decompress))
-        .route("/api/servers/{server}/files/chmod", post(chmod))
+        .route("/api/servers/:server/files/delete", post(delete_files))
+        .route("/api/servers/:server/files/compress", post(compress))
+        .route("/api/servers/:server/files/decompress", post(decompress))
+        .route("/api/servers/:server/files/chmod", post(chmod))
         .route(
-            "/api/servers/{server}/files/pull",
+            "/api/servers/:server/files/pull",
             get(pull_status).post(post_pull).delete(cancel_pull),
         )
 }

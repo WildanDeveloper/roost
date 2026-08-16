@@ -172,7 +172,7 @@ pub struct RemoteQueryConfig {
 }
 
 impl Config {
-    const DEFAULTS: &'static str = include_str!("../config.example.yml");
+    const DEFAULTS: &'static str = include_str!("config.example.yml");
 
     /// Load `config.yml` from disk. If the file is missing, load the
     /// bundled example so defaults are sensible.
@@ -233,7 +233,7 @@ impl Config {
 
     pub fn tmp_dir(&self) -> std::path::PathBuf {
         if self.system.tmp_directory.is_empty() {
-            std::path::Path::new(&self.system.root_directory).join("tmp")
+            std::path::PathBuf::from("/tmp/pterodactyl")
         } else {
             std::path::PathBuf::from(&self.system.tmp_directory)
         }

@@ -108,7 +108,7 @@ impl Server {
             name: RwLock::new(data.settings.meta.name.clone()),
             state: RwLock::new(ServerState::Offline),
             config: RwLock::new(data.settings),
-            process_config: RwLock::new(data.process_configuration),
+            process_config: RwLock::new(data.process_configuration.unwrap_or_default()),
             suspended: AtomicBool::new(false),
             installing: AtomicBool::new(false),
             docker: shared.docker.clone(),
@@ -313,7 +313,7 @@ pub async fn disk_bytes(&self) -> u64 {
 
         self.suspended.store(fresh.settings.suspended, Ordering::SeqCst);
         *self.config.write().await = fresh.settings;
-        *self.process_config.write().await = fresh.process_configuration;
+        *self.process_config.write().await = fresh.process_configuration.unwrap_or_default();
         self.apply_denylist().await;
         tracing::info!(uuid = %self.uuid, "configuration synced from panel");
         Ok(())
@@ -447,6 +447,8 @@ pub async fn disk_bytes(&self) -> u64 {
         std::fs::create_dir_all(self.fs.root())
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create data dir: {e}")))?;
 
+        chown_recursive(self.fs.root(), 1000, 1000);
+
         let image = self.config.read().await.container.image.clone();
 
         if !self.container_matches_config().await {
@@ -475,6 +477,21 @@ pub async fn disk_bytes(&self) -> u64 {
         *self.started_at.lock().await = Some(Instant::now());
         self.set_state(ServerState::Running).await;
         self.start_stats_loop();
+        let name = self.uuid.to_string();
+        let watcher = self.clone();
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut wait = watcher.docker.wait_until_stopped(&name);
+            while let Some(item) = wait.next().await {
+                if let Ok(ev) = item {
+                    let code = ev.status_code;
+                    tracing::info!(uuid = %name, code, "container stopped");
+                    break;
+                }
+            }
+            watcher.set_state(ServerState::Offline).await;
+            watcher.stats_running.store(false, Ordering::SeqCst);
+        });
         tracing::info!(uuid = %self.uuid, "server started");
         Ok(())
     }
@@ -484,6 +501,14 @@ pub async fn disk_bytes(&self) -> u64 {
         let env = self.build_env().await;
         let daemon = self.daemon.read().await.clone();
         let network_ip = daemon.docker.network.interface.clone();
+        if let Err(e) = self
+            .docker
+            .pull_image(&cfg.container.image, &daemon.docker)
+            .await
+        {
+            tracing::warn!(image = %cfg.container.image, error = %e, "could not pull server image");
+            return Err(e);
+        }
         self.docker
             .create_server_container(self.uuid, &cfg, self.fs.root(), &daemon, &env, &network_ip)
             .await?;
@@ -561,4 +586,18 @@ pub async fn disk_bytes(&self) -> u64 {
 pub fn ensure_dir(path: &Path) -> AppResult<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create {}: {e}", path.display())))
+}
+use std::os::unix::fs::chown as unix_chown;
+
+fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) {
+    let _ = unix_chown(path, Some(uid), Some(gid));
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let _ = unix_chown(&p, Some(uid), Some(gid));
+            if p.is_dir() {
+                chown_recursive(&p, uid, gid);
+            }
+        }
+    }
 }

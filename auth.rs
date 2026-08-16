@@ -27,6 +27,7 @@ pub async fn require_authorization(
 
     let expected = state.config.read().await.token.clone().into_bytes();
 
+    tracing::debug!(path = %req.uri(), got = %token.map(|s| s.len()).unwrap_or(0), want = expected.len(), "auth check");
     if provided.ct_eq(&expected).unwrap_u8() == 1 {
         Ok(next.run(req).await)
     } else {

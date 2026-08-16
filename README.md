@@ -31,20 +31,19 @@ with the official daemon — no panel modifications required.
 ## Architecture
 
 ```
-src/
-├── main.rs               entrypoint: config load, dirs, docker, TLS, serve
-├── config.rs             Wings-compatible config.yml load + token resolution
-├── auth.rs               JWT request authentication middleware
-├── jwt/                  token parsing/validation + panel revocation store
-├── state.rs              daemon state and request helpers
-├── error.rs              AppError/AppResult (panel-style JSON errors)
-├── models/               configuration/resource models (Wings-compatible)
-├── docker/               bollard Docker client wrapper + container config
-├── server/               per-server core: state, console, events, files,
-│                         install, manager (start/stop/restart/kill)
-├── remote/               panel client: servers list, config, install/uploads
-└── router/               HTTP routes: system, servers, files, backups,
-                          downloads, middleware, websocket console
+main.rs               entrypoint: config load, dirs, docker, TLS, serve
+config.rs             Wings-compatible config.yml load + token resolution
+auth.rs               JWT request authentication middleware
+jwt/                  token parsing/validation + panel revocation store
+state.rs              daemon state and request helpers
+error.rs              AppError/AppResult (panel-style JSON errors)
+models/               configuration/resource models (Wings-compatible)
+docker/               bollard Docker client wrapper + container config
+server/               per-server core: state, console, events, files,
+                      install, manager (start/stop/restart/kill)
+remote/               panel client: servers list, config, install/uploads
+router/               HTTP routes: system, servers, files, backups,
+                      downloads, middleware, websocket console
 ```
 
 ## Building

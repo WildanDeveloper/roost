@@ -236,7 +236,7 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
         data_dir: &std::path::Path,
         tmp_dir: &std::path::Path,
         image: &str,
-        entrypoint: &[String],
+        entrypoint: &str,
         env: &[String],
         daemon: &Config,
         network_ip: &str,
@@ -257,9 +257,7 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
 
         let mut config = config;
         config.image = Some(image.to_string());
-        let mut cmd = entrypoint.to_vec();
-        cmd.push("/mnt/install/install.sh".to_string());
-        config.cmd = Some(cmd);
+        config.cmd = Some(vec![entrypoint.to_string(), "/mnt/install/install.sh".to_string()]);
         if let Some(labels) = &mut config.labels {
             labels.insert(LABEL_TYPE.to_string(), LABEL_TYPE_INSTALLER.to_string());
         }
@@ -276,6 +274,7 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
         }
         let mut host = host;
         host.mounts = Some(mounts);
+        config.host_config = Some(host);
 
         let options = Some(CreateContainerOptions {
             name: format!("{}_installer", server_uuid),
@@ -574,6 +573,8 @@ fn build_container_config(
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         stdin_once: Some(false),
+        working_dir: Some("/home/container".to_string()),
+        user: Some("1000:1000".to_string()),
         host_config: Some(host_config.clone()),
         ..Default::default()
     };

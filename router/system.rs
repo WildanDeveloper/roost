@@ -15,6 +15,7 @@ use crate::state::DaemonState;
 pub fn router() -> Router<DaemonState> {
     Router::new()
         .route("/api/system", get(get_system_information))
+        .route("/api/test/:x/ping", get(|| async { "ptest" }))
         .route("/api/update", post(post_update_configuration))
         .route("/api/servers", get(get_all_servers).post(post_create_server))
 }

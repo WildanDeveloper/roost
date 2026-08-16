@@ -13,19 +13,21 @@ use crate::state::DaemonState;
 
 pub fn router() -> Router<DaemonState> {
     Router::new()
+        .route("/api/ping", get(|| async { "pong" }))
+        .route("/api/servers/:server/ping2", get(|| async { "pong2" }))
         .route(
-            "/api/servers/{server}",
+            "/api/servers/:server",
             get(get_server).delete(delete_server),
         )
-        .route("/api/servers/{server}/logs", get(get_server_logs))
-        .route("/api/servers/{server}/power", post(post_server_power))
-        .route("/api/servers/{server}/commands", post(post_server_commands))
-        .route("/api/servers/{server}/install", post(post_server_install))
-        .route("/api/servers/{server}/reinstall", post(post_server_reinstall))
-        .route("/api/servers/{server}/sync", post(post_server_sync))
-        .route("/api/servers/{server}/ws/deny", post(post_server_deny_ws_tokens))
+        .route("/api/servers/:server/logs", get(get_server_logs))
+        .route("/api/servers/:server/power", post(post_server_power))
+        .route("/api/servers/:server/commands", post(post_server_commands))
+        .route("/api/servers/:server/install", post(post_server_install))
+        .route("/api/servers/:server/reinstall", post(post_server_reinstall))
+        .route("/api/servers/:server/sync", post(post_server_sync))
+        .route("/api/servers/:server/ws/deny", post(post_server_deny_ws_tokens))
         .route(
-            "/api/servers/{server}/transfer",
+            "/api/servers/:server/transfer",
             post(post_server_transfer).delete(delete_server_transfer),
         )
         .route("/api/deauthorize-user", post(post_deauthorize_user))
