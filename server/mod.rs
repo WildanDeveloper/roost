@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod console;
 pub mod events;
 pub mod files;
@@ -6,4 +7,4 @@ pub mod manager;
 pub mod server;
 
 pub use manager::{ManagerShared, ServerManager};
-pub use server::{Server, ServerState, MAX_WEBSOCKETS_PER_SERVER};
+pub use server::{Server, ServerState, CRASH_RESTART_TX, MAX_WEBSOCKETS_PER_SERVER};

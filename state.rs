@@ -5,6 +5,7 @@ use axum::body::Body;
 use crate::config::Config;
 use crate::jwt::TokenStore;
 use crate::remote::PanelClient;
+use crate::server::activity::ActivityCollector;
 use crate::server::ServerManager;
 use axum::extract::{Request, State};
 use axum::middleware::Next;
@@ -25,6 +26,8 @@ pub struct DaemonState {
     /// Seconds since epoch when the daemon booted. JWTs issued before
     /// this time are rejected.
     pub boot_time: i64,
+    /// Buffered activity events flushed to the panel on an interval.
+    pub activity: Arc<ActivityCollector>,
 }
 
 /// Middleware that makes the state available to other middleware via

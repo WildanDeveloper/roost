@@ -22,6 +22,7 @@ use config::Config;
 use docker::DockerClient;
 use jwt::TokenStore;
 use remote::PanelClient;
+use server::activity::ActivityCollector;
 use server::ServerManager;
 use state::{DaemonState, SharedConfig};
 
@@ -68,12 +69,31 @@ async fn main() -> anyhow::Result<()> {
     let manager = Arc::new(ServerManager::new(docker, shared.clone(), panel.clone()));
     manager.boot().await?;
 
+    let (crash_tx, mut crash_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<server::Server>>();
+    let _ = server::CRASH_RESTART_TX.set(crash_tx);
+    tokio::spawn(async move {
+        while let Some(srv) = crash_rx.recv().await {
+            if let Err(e) = srv.power_start().await {
+                tracing::warn!(uuid = %srv.uuid, error = %e, "failed to restart after crash");
+            }
+        }
+    });
+
+    let activity = Arc::new(ActivityCollector::new());
+    {
+        let cfg = shared.read().await;
+        let interval = std::time::Duration::from_secs(cfg.system.activity_send_interval.max(1));
+        let count = cfg.system.activity_send_count.max(1);
+        tokio::spawn(activity.clone().flush_task(panel.clone(), interval, count));
+    }
+
     let state = DaemonState {
         config: shared.clone(),
         manager,
         panel,
         tokens,
         boot_time,
+        activity,
     };
 
     let app = router::build(state);

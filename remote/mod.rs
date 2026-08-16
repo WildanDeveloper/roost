@@ -142,6 +142,30 @@ pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::Bac
             .await
     }
 
+    /// Send a batch of activity events to the panel (POST /api/remote/activity,
+    /// body {"data": [...]}).
+    pub async fn send_activity_logs(&self, activity: &[crate::models::Activity]) -> AppResult<()> {
+        #[derive(serde::Serialize)]
+        struct Wrapper<'a> {
+            data: &'a [crate::models::Activity],
+        }
+        self.request(reqwest::Method::POST, "/activity", Some(&Wrapper { data: activity }))
+            .await
+            .map(|_: serde_json::Value| ())
+    }
+
+    /// Report the outcome of a server transfer to the panel.
+    #[allow(dead_code)]
+    pub async fn post_transfer_status(&self, uuid: Uuid, successful: bool) -> AppResult<()> {
+        self.request(
+            reqwest::Method::POST,
+            &format!("/servers/{uuid}/transfer"),
+            Some(&types::StatusMessage { successful }),
+        )
+        .await
+        .map(|_: serde_json::Value| ())
+    }
+
     /// Low-level request with retry. Wings retries 5xx and transport
     /// errors with exponential backoff, capped at ~30s; 4xx is permanent.
     async fn request<T: serde::de::DeserializeOwned, B: serde::Serialize>(
@@ -187,6 +211,11 @@ pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::Bac
                             .to_string();
                         let text = resp.text().await.unwrap_or_default();
                         tracing::debug!(path, status = %status, len, ct, body_len = text.len(), "panel response");
+                        if text.trim().is_empty() {
+                            return serde_json::from_str("null").map_err(|e| {
+                                AppError::Remote(format!("bad panel response: {e}"))
+                            });
+                        }
                         return serde_json::from_str::<T>(&text).map_err(|e| {
                             AppError::Remote(format!(
                                 "bad panel response: {e}; body: {}",

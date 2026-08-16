@@ -62,6 +62,18 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
         }
     }
 
+    /// Whether the container was killed due to OOM (wings crash.go uses
+    /// this to decide if an exit counts as a crash).
+    pub async fn container_was_oom_killed(&self, name: &str) -> AppResult<bool> {
+        let Some(resp) = self.inspect_container(name).await? else {
+            return Ok(false);
+        };
+        Ok(resp
+            .state
+            .and_then(|s| s.oom_killed)
+            .unwrap_or(false))
+    }
+
     /// Create the daemon bridge network if it does not exist.
     pub async fn ensure_network(&self, net: &DockerNetworkConfig) -> AppResult<()> {
         if !net.name.is_empty() {

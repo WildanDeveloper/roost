@@ -62,6 +62,8 @@ pub struct SystemConfig {
     pub disk_check_interval: u64,
     pub websocket_log_count: usize,
     pub check_permissions_on_boot: bool,
+    pub activity_send_interval: u64,
+    pub activity_send_count: usize,
     pub sftp: SftpConfig,
     pub crash_detection: CrashDetectionConfig,
 }
@@ -74,12 +76,23 @@ pub struct SftpConfig {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CrashDetectionConfig {
     pub enabled: bool,
     pub detect_clean_exit_as_crash: bool,
     pub timeout: u64,
+}
+
+impl Default for CrashDetectionConfig {
+    fn default() -> Self {
+        // Wings defaults when the daemon config omits the section.
+        Self {
+            enabled: true,
+            detect_clean_exit_as_crash: true,
+            timeout: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

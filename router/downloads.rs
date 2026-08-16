@@ -126,7 +126,7 @@ async fn upload_file(
     Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> AppResult<Response> {
-    let (_claims, server) = authorize(state.clone(), &query.token, "file-upload").await?;
+    let (claims, server) = authorize(state.clone(), &query.token, "file-upload").await?;
     let daemon = state.config.read().await.clone();
     let max_bytes = daemon.api.upload_limit.saturating_mul(1024 * 1024);
 
@@ -160,6 +160,16 @@ async fn upload_file(
 
         let path = format!("{}/{}", query.directory.trim_matches('/'), name);
         server.fs.write(&path, &collected)?;
+
+        state.activity.push(
+            crate::models::Activity::new(&server.uuid.to_string(), "server:file.uploaded")
+                .with_user(claims.user_uuid.clone())
+                .with_metadata(serde_json::json!({
+                    "directory": query.directory,
+                    "name": name,
+                    "size": collected.len() as u64,
+                })),
+        );
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())

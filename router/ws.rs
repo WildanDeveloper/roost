@@ -284,20 +284,37 @@ async fn handle_inbound(
     match inbound.event.as_str() {
         "set state" => {
             let action = inbound.args.first().map(|s| s.as_str()).unwrap_or("");
+            let user = claims.user_uuid.clone();
             match action {
                 "start" if claims.has_permission("control.start") => {
+                    state.activity.push(
+                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.start")
+                            .with_user(user),
+                    );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_start().await; });
                 }
                 "stop" if claims.has_permission("control.stop") => {
+                    state.activity.push(
+                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.stop")
+                            .with_user(user),
+                    );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_stop(30).await; });
                 }
                 "restart" if claims.has_permission("control.restart") => {
+                    state.activity.push(
+                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.restart")
+                            .with_user(user),
+                    );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_restart(30).await; });
                 }
                 "kill" if claims.has_permission("control.stop") => {
+                    state.activity.push(
+                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.kill")
+                            .with_user(user),
+                    );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_kill().await; });
                 }
@@ -309,6 +326,11 @@ async fn handle_inbound(
         "send command" if claims.has_permission("control.console") => {
             let command = inbound.args.join("");
             if !command.is_empty() {
+                state.activity.push(
+                    crate::models::Activity::new(&server.uuid.to_string(), "server:console.command")
+                        .with_user(claims.user_uuid.clone())
+                        .with_metadata(serde_json::json!({ "command": command })),
+                );
                 let _ = server.send_command(&command).await;
             }
         }

@@ -50,6 +50,12 @@ pub struct CpuPrev {
 }
 
 /// One managed server on this node.
+/// Servers that crashed and need an automatic restart, dispatched to the
+/// neutral restart loop in main (keeps the crash path out of the
+/// start_unlocked/power_start opaque-future cycle).
+pub static CRASH_RESTART_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Arc<Server>>> =
+    std::sync::OnceLock::new();
+
 pub struct Server {
     pub uuid: Uuid,
     #[allow(dead_code)]
@@ -87,6 +93,8 @@ pub struct Server {
 
     /// Connected websocket clients (for the connection cap).
     pub ws_connections: AtomicUsize,
+    /// Last crash time for wings-style crash detection.
+    last_crash: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// GET /api/servers and GET /api/servers/:id response shape.
@@ -126,6 +134,7 @@ impl Server {
             console_tx: RwLock::new(None),
             stats_running: AtomicBool::new(false),
             ws_connections: AtomicUsize::new(0),
+            last_crash: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -482,15 +491,18 @@ pub async fn disk_bytes(&self) -> u64 {
         tokio::spawn(async move {
             use futures_util::StreamExt;
             let mut wait = watcher.docker.wait_until_stopped(&name);
+            let mut code = None;
             while let Some(item) = wait.next().await {
                 if let Ok(ev) = item {
-                    let code = ev.status_code;
-                    tracing::info!(uuid = %name, code, "container stopped");
+                    code = Some(ev.status_code);
+                    tracing::info!(uuid = %name, code = ev.status_code, "container stopped");
                     break;
                 }
             }
+            drop(wait);
             watcher.set_state(ServerState::Offline).await;
             watcher.stats_running.store(false, Ordering::SeqCst);
+            tokio::spawn(Server::handle_server_crash(watcher, code));
         });
         tracing::info!(uuid = %self.uuid, "server started");
         Ok(())
@@ -514,6 +526,56 @@ pub async fn disk_bytes(&self) -> u64 {
             .await?;
         *self.container_fingerprint.write().await = Some(self.fingerprint().await);
         Ok(())
+    }
+
+    async fn handle_server_crash(self: Arc<Self>, exit_code: Option<i64>) {
+        let srv_cfg = self.config.read().await.clone();
+        let daemon_cfg = self.daemon.read().await.clone();
+        if !srv_cfg.crash_detection_enabled || !daemon_cfg.system.crash_detection.enabled {
+            return;
+        }
+        if self.is_installing() || self.suspended.load(Ordering::SeqCst) {
+            return;
+        }
+        let code = exit_code.unwrap_or(0);
+        let oom = self
+            .docker
+            .container_was_oom_killed(&self.uuid.to_string())
+            .await
+            .unwrap_or(false);
+        if code == 0 && !oom && !daemon_cfg.system.crash_detection.detect_clean_exit_as_crash {
+            return;
+        }
+        self.publish_daemon_message(format!("---------- Detected server process in a crashed state! ----------"));
+        self.publish_daemon_message(format!("Exit code: {code}"));
+        self.publish_daemon_message(format!("Out of memory: {oom}"));
+
+        let timeout = daemon_cfg.system.crash_detection.timeout;
+        let should_restart = {
+            let mut last = self.last_crash.lock().await;
+            if timeout != 0 && last.is_some() && last.unwrap().elapsed() < std::time::Duration::from_secs(timeout) {
+                self.publish_daemon_message(format!(
+                    "Aborting automatic restart, last crash occurred less than {timeout} seconds ago."
+                ));
+                false
+            } else {
+                *last = Some(std::time::Instant::now());
+                true
+            }
+        };
+        if should_restart {
+            self.publish_daemon_message("Restarting server process after crash...".to_string());
+            if let Some(tx) = CRASH_RESTART_TX.get() {
+                let _ = tx.send(self);
+            } else {
+                tracing::warn!(uuid = %self.uuid, "crash restart channel not initialized");
+            }
+        }
+    }
+
+    /// Push a daemon-originated console line (crash notices, etc).
+    async fn publish_daemon_message(&self, msg: String) {
+        self.publish(ServerEvent::DaemonMessage(msg));
     }
 
     pub async fn power_start(self: &Arc<Self>) -> AppResult<()> {
