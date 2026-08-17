@@ -601,6 +601,18 @@ pub async fn disk_bytes(&self) -> u64 {
         let env = self.build_env().await;
         let daemon = self.daemon.read().await.clone();
         let network_ip = daemon.docker.network.interface.clone();
+        // Wings server.go CreateEnvironment: write a per-server machine-id
+        // (UUID without dashes) for the /etc/machine-id mount.
+        if daemon.system.machine_id.enabled {
+            let path = std::path::Path::new(&daemon.system.machine_id.directory)
+                .join(self.uuid.to_string());
+            if let Err(e) = std::fs::write(
+                &path,
+                format!("{}\n", self.uuid.to_string().replace('-', "")),
+            ) {
+                tracing::warn!(path = %path.display(), error = %e, "cannot write machine-id file");
+            }
+        }
         if let Err(e) = self
             .docker
             .pull_image(&cfg.container.image, &daemon.docker)

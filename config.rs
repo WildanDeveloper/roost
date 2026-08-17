@@ -155,18 +155,36 @@ pub struct RootlessConfig {
     pub container_gid: i64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PasswdConfig {
     pub enabled: bool,
     pub directory: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+impl Default for PasswdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: "/run/wings/etc".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MachineIdConfig {
     pub enabled: bool,
     pub directory: String,
+}
+
+impl Default for MachineIdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: "/run/wings/machine-id".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -399,6 +417,42 @@ impl Config {
         if !self.system.data.is_empty() {
             std::fs::create_dir_all(&self.system.data).map_err(|e| {
                 AppError::Config(format!("cannot create {}: {e}", self.system.data))
+            })?;
+        }
+        // Wings ConfigurePasswd: generate /etc/{group,passwd} overrides for
+        // containers when the feature is enabled.
+        if self.system.passwd.enabled {
+            std::fs::create_dir_all(&self.system.passwd.directory).map_err(|e| {
+                AppError::Config(format!(
+                    "cannot create {}: {e}",
+                    self.system.passwd.directory
+                ))
+            })?;
+            let group = format!(
+                "root:x:0:\ncontainer:x:{}:\nnogroup:x:65534:\n",
+                self.system.user.gid
+            );
+            let passwd = format!(
+                "root:x:0:0::/root:/bin/sh\ncontainer:x:{}:{}::/home/container:/bin/sh\nnobody:x:65534:65534::/var/empty:/bin/sh\n",
+                self.system.user.uid, self.system.user.gid
+            );
+            std::fs::write(
+                std::path::Path::new(&self.system.passwd.directory).join("group"),
+                group,
+            )
+            .map_err(|e| AppError::Config(format!("cannot write passwd group file: {e}")))?;
+            std::fs::write(
+                std::path::Path::new(&self.system.passwd.directory).join("passwd"),
+                passwd,
+            )
+            .map_err(|e| AppError::Config(format!("cannot write passwd file: {e}")))?;
+        }
+        if self.system.machine_id.enabled {
+            std::fs::create_dir_all(&self.system.machine_id.directory).map_err(|e| {
+                AppError::Config(format!(
+                    "cannot create {}: {e}",
+                    self.system.machine_id.directory
+                ))
             })?;
         }
         Ok(())

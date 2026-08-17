@@ -612,6 +612,29 @@ fn build_container_config(
     }
 
     let mut mounts = vec![mount(data_dir, "/home/container", false)];
+    // Wings mounts.go: generated /etc/{group,passwd} overrides to work around
+    // UID/GID issues, and a per-server /etc/machine-id.
+    if daemon.system.passwd.enabled {
+        mounts.push(mount(
+            std::path::Path::new(&daemon.system.passwd.directory).join("group").as_path(),
+            "/etc/group",
+            true,
+        ));
+        mounts.push(mount(
+            std::path::Path::new(&daemon.system.passwd.directory).join("passwd").as_path(),
+            "/etc/passwd",
+            true,
+        ));
+    }
+    if daemon.system.machine_id.enabled {
+        mounts.push(mount(
+            std::path::Path::new(&daemon.system.machine_id.directory)
+                .join(cfg.uuid.to_string())
+                .as_path(),
+            "/etc/machine-id",
+            true,
+        ));
+    }
     for m in &cfg.mounts {
         let source = std::path::Path::new(&m.source);
         let allowed = daemon
