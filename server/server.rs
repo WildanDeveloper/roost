@@ -769,9 +769,16 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     /// Kill the process and remove the container (+ data dir optionally).
-    /// Publishes DeletedEvent for the panel to clean up.
+    /// Mirrors wings deleteServer: suspend, notify clients (Deleted /
+    /// TransferStatus), destroy environment, remove files.
     pub async fn delete_container(&self, remove_data: bool) -> AppResult<()> {
+        self.suspended.store(true, Ordering::SeqCst);
+
+        if self.is_transferring() {
+            self.publish(ServerEvent::TransferStatus("completed".into()));
+        }
         self.publish(ServerEvent::Deleted);
+        self.cancel_transfer_task().await;
         let _ = self.power_kill().await;
         self.docker.remove(&self.uuid.to_string()).await?;
         self.docker.remove(&format!("{}_installer", self.uuid)).await?;

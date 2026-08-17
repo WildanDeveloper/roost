@@ -231,6 +231,18 @@ async fn post_deauthorize_user(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     state.tokens.deny_user(&payload.user.to_string(), now).await;
+
+    // Mirrors wings postDeauthorizeUser: cancel SFTP sessions for the
+    // user's servers (websockets re-validate the JWT per message, so the
+    // deny list above already disables them).
+    let servers: Vec<Uuid> = if payload.servers.is_empty() {
+        state.manager.all_uuids().await
+    } else {
+        payload.servers.clone()
+    };
+    for uuid in servers {
+        crate::sftp::cancel_sessions_for(&uuid.to_string()).await;
+    }
     tracing::info!(user = %payload.user, servers = ?payload.servers, "user deauthorized");
     Ok(StatusCode::NO_CONTENT.into_response())
 }
