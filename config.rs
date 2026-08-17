@@ -3,6 +3,8 @@ use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 
+fn default_true() -> bool { true }
+
 /// Daemon configuration, designed to be drop-in compatible with the
 /// Pterodactyl Wings `config.yml` (v1.13.3 schema). The panel generates
 /// this file for you on the node (Settings > Nodes > edit node). Missing
@@ -18,6 +20,8 @@ pub struct Config {
     pub api: ApiConfig,
     pub system: SystemConfig,
     pub docker: DockerConfig,
+    #[serde(default)]
+    pub throttles: ConsoleThrottles,
     pub remote: String,
     pub remote_query: RemoteQueryConfig,
     pub allowed_mounts: Vec<String>,
@@ -62,8 +66,19 @@ pub struct SystemConfig {
     pub disk_check_interval: u64,
     pub websocket_log_count: usize,
     pub check_permissions_on_boot: bool,
+    pub enable_log_rotate: bool,
+    pub openat_mode: String,
     pub activity_send_interval: u64,
     pub activity_send_count: usize,
+    pub user: UserConfig,
+    #[serde(default)]
+    pub passwd: PasswdConfig,
+    #[serde(default)]
+    pub machine_id: MachineIdConfig,
+    #[serde(default)]
+    pub backups: BackupsConfig,
+    #[serde(default)]
+    pub transfers: TransfersConfig,
     pub sftp: SftpConfig,
     pub crash_detection: CrashDetectionConfig,
 }
@@ -106,6 +121,68 @@ impl Default for CrashDetectionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ConsoleThrottles {
+    pub enabled: bool,
+    pub lines: u64,
+    pub line_reset_interval: u64,
+}
+
+impl Default for ConsoleThrottles {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lines: 2000,
+            line_reset_interval: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UserConfig {
+    pub uid: i64,
+    pub gid: i64,
+    pub rootless: RootlessConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RootlessConfig {
+    pub enabled: bool,
+    pub container_uid: i64,
+    pub container_gid: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PasswdConfig {
+    pub enabled: bool,
+    pub directory: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MachineIdConfig {
+    pub enabled: bool,
+    pub directory: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BackupsConfig {
+    pub write_limit: i64,
+    pub compression_level: String,
+    pub restore_host_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransfersConfig {
+    pub download_limit: i64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DockerConfig {
@@ -116,10 +193,30 @@ pub struct DockerConfig {
     pub container_pid_limit: i64,
     pub installer_limits: InstallerLimits,
     pub cpu_period: u64,
+    #[serde(default)]
+    pub cpu_burst: CpuBurstConfig,
     pub cpu_shares: u64,
     pub overhead: OverheadConfig,
+    #[serde(default = "default_true")]
+    pub use_performant_inspect: bool,
     pub userns_mode: String,
     pub log_config: LogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CpuBurstConfig {
+    pub enabled: bool,
+    pub percent: i64,
+}
+
+impl Default for CpuBurstConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            percent: 100,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

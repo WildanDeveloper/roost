@@ -31,6 +31,27 @@ system:
   disk_check_interval: 150
   websocket_log_count: 150
   check_permissions_on_boot: true
+  enable_log_rotate: true
+  openat_mode: auto
+  user:
+    uid: 988
+    gid: 988
+    rootless:
+      enabled: false
+      container_uid: 0
+      container_gid: 0
+  passwd:
+    enabled: false
+    directory: /run/wings/etc
+  machine_id:
+    enabled: true
+    directory: /run/wings/machine-id
+  backups:
+    write_limit: 0
+    compression_level: best_speed
+    restore_host_allowlist: []
+  transfers:
+    download_limit: 0
   sftp:
     bind_address: 0.0.0.0
     bind_port: 2022
@@ -66,6 +87,9 @@ docker:
     memory: 1024
     cpu: 100
   cpu_period: 100000
+  cpu_burst:
+    enabled: true
+    percent: 100
   cpu_shares: 0
   overhead:
     override_multiplier: false
@@ -75,6 +99,7 @@ docker:
         overhead: 1.15
       - memory: 4096
         overhead: 1.10
+  use_performant_inspect: true
   userns_mode: ""
   log_config:
     type: local
@@ -93,3 +118,8 @@ allowed_mounts: []
 allowed_origins: []
 allow_cors_private_network: false
 ignore_panel_config_updates: false
+
+throttles:
+  enabled: true
+  lines: 2000
+  line_reset_interval: 100
