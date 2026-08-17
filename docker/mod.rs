@@ -1,3 +1,4 @@
+pub mod cgroup;
 pub mod client;
 pub mod settings;
 

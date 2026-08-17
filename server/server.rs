@@ -727,8 +727,28 @@ pub async fn disk_bytes(&self) -> u64 {
         let cfg = self.config.read().await;
         let daemon = self.daemon.read().await.clone();
         let resources = cfg.build.as_container_resources(&daemon.docker, false);
+        let cpu_burst = daemon.docker.cpu_burst.clone();
         drop(cfg);
-        self.docker.update_resources(&self.uuid.to_string(), &resources).await
+        // The kernel rejects a CFS quota lower than the current burst, so
+        // remove the burst before updating the limits and re-apply it after
+        // (wings container.go).
+        let name = self.uuid.to_string();
+        crate::docker::cgroup::clear_cpu_burst(&self.docker, &name).await;
+        self.docker.update_resources(&name, &resources).await?;
+        if cpu_burst.enabled {
+            let quota = resources
+                .cpu_quota
+                .unwrap_or(0);
+            crate::docker::cgroup::set_cpu_burst(
+                &self.docker,
+                &name,
+                quota,
+                cpu_burst.enabled,
+                cpu_burst.percent,
+            )
+            .await;
+        }
+        Ok(())
     }
 
     pub fn is_transferring(&self) -> bool {
