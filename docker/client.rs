@@ -502,7 +502,23 @@ fn build_container_config(
         labels.insert(k.clone(), v.clone());
     }
 
-    let mounts = vec![mount(data_dir, "/home/container", false)];
+    let mut mounts = vec![mount(data_dir, "/home/container", false)];
+    for m in &cfg.mounts {
+        let source = std::path::Path::new(&m.source);
+        let allowed = daemon
+            .allowed_mounts
+            .iter()
+            .any(|a| source.starts_with(std::path::Path::new(a)));
+        if !allowed {
+            tracing::warn!(
+                uuid = %cfg.uuid,
+                source = %m.source,
+                "skipping custom server mount, not in list of allowed mount points"
+            );
+            continue;
+        }
+        mounts.push(mount(std::path::Path::new(&m.source), &m.target, m.read_only));
+    }
 
     let mut tmpfs = HashMap::new();
     tmpfs.insert(
