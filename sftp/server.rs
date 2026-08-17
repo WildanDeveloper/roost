@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use uuid::Uuid;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,6 @@ use russh_sftp::protocol::{
 use russh_sftp::server::{Handler as SftpFsHandler, StatusReply};
 
 use crate::config::SftpConfig;
-use crate::remote::types::SftpAuthResponse;
 use crate::server::activity::ActivityCollector;
 use crate::server::ServerManager;
 

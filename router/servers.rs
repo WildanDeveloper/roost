@@ -66,8 +66,7 @@ async fn get_server_logs(
 
     let mut lines = Vec::new();
     let mut stream = server.docker.logs_tail(&server.uuid.to_string(), size);
-    use futures_util::StreamExt;
-    while let Some(item) = stream.next().await {
+    while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
         match item {
             Ok(bollard::container::LogOutput::StdOut { message: bytes })
             | Ok(bollard::container::LogOutput::StdErr { message: bytes }) => {
@@ -286,7 +285,10 @@ async fn post_server_transfer(
                 tracing::warn!(uuid = %task_server.uuid, error = %e, "outgoing transfer failed");
                 task_server.publish(crate::server::events::ServerEvent::TransferStatus("failure".into()));
                 let _ = panel.read().await.post_transfer_status(task_server.uuid, false).await;
-                task_server.publish_daemon_message(format!("Transfer failed: {e}"));
+                let srv = task_server.clone();
+                tokio::spawn(async move {
+                    srv.publish_daemon_message(format!("Transfer failed: {e}")).await;
+                });
             }
         }
         task_server.set_transferring(false);
@@ -347,7 +349,7 @@ async fn push_archive_to_target(
         let encoder = builder.into_inner().map_err(|e| {
             AppError::Internal(anyhow::anyhow!("cannot finish archive: {e}"))
         })?;
-        let file = encoder.finish().map_err(|e| {
+        let _file = encoder.finish().map_err(|e| {
             AppError::Internal(anyhow::anyhow!("cannot finish gzip: {e}"))
         })?;
         let mut file = std::fs::File::open(&archive_path)
@@ -371,7 +373,6 @@ async fn push_archive_to_target(
 
     // 2. Stream it to the destination (wings: Authorization header is the
     // raw token string provided by the panel, e.g. "Bearer ...").
-    use futures_util::StreamExt;
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(&archive_path).await.map_err(|e| {
         AppError::Internal(anyhow::anyhow!("cannot open archive: {e}"))

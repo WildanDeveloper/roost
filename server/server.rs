@@ -552,17 +552,24 @@ pub async fn disk_bytes(&self) -> u64 {
         if code == 0 && !oom && !daemon_cfg.system.crash_detection.detect_clean_exit_as_crash {
             return;
         }
-        self.publish_daemon_message(format!("---------- Detected server process in a crashed state! ----------"));
-        self.publish_daemon_message(format!("Exit code: {code}"));
-        self.publish_daemon_message(format!("Out of memory: {oom}"));
+        let srv = self.clone();
+        tokio::spawn(async move {
+            srv.publish_daemon_message(format!("---------- Detected server process in a crashed state! ----------")).await;
+            srv.publish_daemon_message(format!("Exit code: {code}")).await;
+            srv.publish_daemon_message(format!("Out of memory: {oom}")).await;
+        });
 
         let timeout = daemon_cfg.system.crash_detection.timeout;
         let should_restart = {
             let mut last = self.last_crash.lock().await;
             if timeout != 0 && last.is_some() && last.unwrap().elapsed() < std::time::Duration::from_secs(timeout) {
-                self.publish_daemon_message(format!(
-                    "Aborting automatic restart, last crash occurred less than {timeout} seconds ago."
-                ));
+                let srv = self.clone();
+                tokio::spawn(async move {
+                    srv.publish_daemon_message(format!(
+                        "Aborting automatic restart, last crash occurred less than {timeout} seconds ago."
+                    ))
+                    .await;
+                });
                 false
             } else {
                 *last = Some(std::time::Instant::now());
@@ -570,7 +577,11 @@ pub async fn disk_bytes(&self) -> u64 {
             }
         };
         if should_restart {
-            self.publish_daemon_message("Restarting server process after crash...".to_string());
+            let srv = self.clone();
+            tokio::spawn(async move {
+                srv.publish_daemon_message("Restarting server process after crash...".to_string())
+                    .await;
+            });
             if let Some(tx) = CRASH_RESTART_TX.get() {
                 let _ = tx.send(self);
             } else {
