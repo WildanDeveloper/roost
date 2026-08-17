@@ -178,8 +178,14 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
     }
 
     /// Pull an image if it isn't available locally. Mirrors wings: on
-    /// failure to pull, fall back to the locally cached image.
+    /// failure to pull, fall back to the locally cached image. A `~`
+    /// prefix on the image name skips the pull entirely (local-only image).
     pub async fn pull_image(&self, image: &str, config: &DockerConfig) -> AppResult<()> {
+        // ~ prefix = local-only image, skip pull.
+        if image.starts_with('~') {
+            tracing::debug!(image, "skipping pull for local-only image (~ prefix)");
+            return Ok(());
+        }
         if self.image_exists(image).await? {
             return Ok(());
         }
@@ -295,6 +301,8 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
             }
         }
         let mut host = host;
+        // Wings removes PIDs limit for installer containers.
+        host.pids_limit = None;
         host.mounts = Some(mounts);
         config.host_config = Some(host);
 
@@ -333,7 +341,7 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
 
     pub async fn remove(&self, name: &str) -> AppResult<()> {
         let options = Some(bollard::container::RemoveContainerOptions {
-            v: false,
+            v: true,
             force: true,
             link: false,
         });
@@ -612,7 +620,7 @@ fn build_container_config(
         attach_stderr: Some(true),
         stdin_once: Some(false),
         working_dir: Some("/home/container".to_string()),
-        user: Some("1000:1000".to_string()),
+        user: Some(container_user(daemon)),
         host_config: Some(host_config.clone()),
         ..Default::default()
     };
@@ -622,20 +630,62 @@ fn build_container_config(
 }
 
 /// Build Docker credentials for the registry the image belongs to.
+/// Uses path-aware matching like wings: supports registries with paths
+/// (e.g., `ghcr.io/org/repo`) in addition to hostname-only matching.
 fn registry_auth_for(image: &str, registries: &[RegistryConfig]) -> Option<DockerCredentials> {
-    let registry = image.split('/').next().unwrap_or("");
-    registries
-        .iter()
-        .find(|r| r.name == registry)
-        .map(|r| DockerCredentials {
-            username: Some(r.username.clone()),
-            password: Some(r.password.clone()),
-            serveraddress: Some(r.name.clone()),
-            identitytoken: None,
-            registrytoken: None,
-            auth: None,
-            email: None,
-        })
+    // Strip tag if present.
+    let image = if let Some((base, tag)) = image.rsplit_once(':') {
+        if !tag.contains('/') { base } else { image }
+    } else {
+        image
+    };
+    // Normalize: docker.io prefix.
+    let image_domain = image.split('/').next().unwrap_or("");
+    let mut image_path = "";
+    if let Some(slash_pos) = image.find('/') {
+        let rest = &image[slash_pos + 1..];
+        // If it looks like docker.io/user/image, extract the path.
+        if image_domain == "docker.io" || !image_domain.contains('.') {
+            // Single-component names are library images (no registry).
+            if !image_domain.contains('.') {
+                return None;
+            }
+        } else {
+            image_path = rest;
+        }
+    }
+
+    let mut best: Option<(&RegistryConfig, usize)> = None;
+    for r in registries {
+        let reg_domain = r.name.split('/').next().unwrap_or("");
+        let reg_path = if let Some(slash) = r.name.find('/') {
+            &r.name[slash + 1..]
+        } else {
+            ""
+        };
+        if reg_domain != image_domain {
+            continue;
+        }
+        // Path match: empty registry path matches everything; otherwise
+        // image path must equal or be under the registry path.
+        if !reg_path.is_empty() && image_path != reg_path && !image_path.starts_with(&format!("{reg_path}/")) {
+            continue;
+        }
+        let score = reg_domain.len() + reg_path.len();
+        if best.as_ref().map_or(true, |(_, s)| score > *s) {
+            best = Some((r, score));
+        }
+    }
+
+    best.map(|(r, _)| DockerCredentials {
+        username: Some(r.username.clone()),
+        password: Some(r.password.clone()),
+        serveraddress: Some(r.name.clone()),
+        identitytoken: None,
+        registrytoken: None,
+        auth: None,
+        email: None,
+    })
 }
 
 fn split_image_tag(image: &str) -> (&str, Option<&str>) {
@@ -645,4 +695,17 @@ fn split_image_tag(image: &str) -> (&str, Option<&str>) {
         }
     }
     (image, None)
+}
+
+/// Determine the UID:GID string for containers from daemon config.
+/// Wings uses system.user.uid/gid or system.user.rootless.container_uid/container_gid.
+fn container_user(daemon: &Config) -> String {
+    let u = &daemon.system.user;
+    if u.rootless.enabled {
+        return format!("{}:{}", u.rootless.container_uid, u.rootless.container_gid);
+    }
+    if u.uid != 0 && u.gid != 0 {
+        return format!("{}:{}", u.uid, u.gid);
+    }
+    "988:988".to_string()
 }
