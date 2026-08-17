@@ -24,14 +24,14 @@ pub enum AppError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("bad gateway: {0}")]
+    BadGateway(String),
+
     #[error("unprocessable entity: {0}")]
     Unprocessable(String),
 
     #[error("conflict: {0}")]
     Conflict(String),
-
-    #[error("payload too large")]
-    PayloadTooLarge,
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -60,9 +60,9 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, self.to_string(), false),
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string(), false),
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string(), false),
+            AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, self.to_string(), false),
             AppError::Unprocessable(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string(), false),
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string(), false),
-            AppError::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string(), false),
             AppError::Docker(_) | AppError::Io(_) | AppError::Internal(_) | AppError::Config(_) | AppError::Remote(_) | AppError::NotImplemented(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string(), true)
             }

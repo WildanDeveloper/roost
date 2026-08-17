@@ -223,7 +223,7 @@ impl Server {
     /// Send a command to the container's stdin. Only valid while running.
     pub async fn send_command(&self, command: &str) -> AppResult<()> {
         if !self.is_running() {
-            return Err(AppError::BadRequest(
+            return Err(AppError::BadGateway(
                 "Cannot send commands to a stopped server instance.".into(),
             ));
         }

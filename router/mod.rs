@@ -26,7 +26,11 @@ pub fn build(state: DaemonState) -> Router {
         .merge(system::router())
         .merge(servers::router())
         .merge(files::router())
-        .merge(backups::router());
+        .merge(backups::router())
+        // Panel-initiated cancel of an incoming transfer (wings keeps this
+        // on the protected router without ServerExists; unknown server -> 404
+        // handled by server_exists below).
+        .route("/api/transfers/:server", axum::routing::delete(downloads::delete_incoming_transfer));
 
     let protected = protected
         .route_layer(from_fn_with_state(state.clone(), middleware::server_exists))

@@ -14,8 +14,6 @@ use crate::state::DaemonState;
 
 pub fn router() -> Router<DaemonState> {
     Router::new()
-        .route("/api/ping", get(|| async { "pong" }))
-        .route("/api/servers/:server/ping2", get(|| async { "pong2" }))
         .route(
             "/api/servers/:server",
             get(get_server).delete(delete_server),
@@ -48,12 +46,7 @@ async fn delete_server(
 
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
-    #[serde(default = "default_log_size")]
-    size: u32,
-}
-
-fn default_log_size() -> u32 {
-    100
+    size: Option<String>,
 }
 
 /// GET /api/servers/:id/logs?size=N  ->  {"data": [lines]}
@@ -61,7 +54,11 @@ async fn get_server_logs(
     server: crate::router::middleware::ServerExtractor,
     Query(query): Query<LogsQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let size = query.size.clamp(1, 100);
+    let size = query
+        .size
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(100);
+    let size = if size <= 0 || size > 100 { 100 } else { size as u32 };
     let server = server;
 
     let mut lines = Vec::new();
@@ -86,7 +83,7 @@ async fn get_server_logs(
 struct PowerRequest {
     action: String,
     #[serde(default)]
-    wait_seconds: Option<u32>,
+    wait_seconds: Option<i64>,
 }
 
 static POWER_ACTIONS: [&str; 4] = ["start", "stop", "restart", "kill"];
@@ -97,13 +94,19 @@ async fn post_server_power(
     Json(payload): Json<PowerRequest>,
 ) -> AppResult<Response> {
     if !POWER_ACTIONS.contains(&payload.action.as_str()) {
-        return Err(AppError::Unprocessable(format!("invalid power action: {}", payload.action)));
+        return Err(AppError::Unprocessable(format!(
+            "The power action provided was not valid, should be one of \"stop\", \"start\", \"restart\", \"kill\""
+        )));
     }
-    if server.suspended.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(AppError::BadRequest("server is suspended".into()));
+    if (payload.action == "start" || payload.action == "restart") && server.suspended.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(AppError::BadRequest(
+            "Cannot start or restart a server that is suspended.".into(),
+        ));
     }
 
-    let wait = payload.wait_seconds.unwrap_or(30).min(300);
+    let wait = payload.wait_seconds.unwrap_or(30);
+    let wait = if wait < 0 || wait > 300 { 30 } else { wait as u32 };
     let server = server.0.clone();
 
     tokio::spawn(async move {

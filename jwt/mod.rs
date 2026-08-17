@@ -22,6 +22,7 @@ pub struct Claims {
     pub unique_id: Option<String>,
     pub jti: Option<String>,
     pub backup_uuid: Option<String>,
+    pub file_path: Option<String>,
     pub iss: Option<String>,
     pub iat: Option<i64>,
     pub nbf: Option<i64>,

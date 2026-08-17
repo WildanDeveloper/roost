@@ -1,7 +1,7 @@
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 
 use serde::Deserialize;
@@ -20,27 +20,17 @@ pub fn router() -> Router<DaemonState> {
         .route("/upload/file", post(upload_file))
         // Transfer destination endpoint (called by other daemons).
         .route("/api/transfers", post(incoming_transfer))
-        .route(
-            "/api/transfers/:server",
-            delete(delete_incoming_transfer),
-        )
 }
 
 /// Cancel an incoming transfer for a server (panel-initiated). Mirrors
-/// wings `deleteTransfer`: 409 unless a transfer is actually in progress,
-/// otherwise abort it and report the failure to the panel.
-async fn delete_incoming_transfer(
+/// wings `deleteTransfer`: 404 for an unknown server (via the protected
+/// router's server_exists), 409 unless a transfer is actually in progress.
+/// Lives on the protected router (authorization required).
+pub async fn delete_incoming_transfer(
     State(state): State<DaemonState>,
     Path(uuid): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    let server = match state.manager.get(uuid).await {
-        Ok(server) => server,
-        Err(_) => {
-            return Err(AppError::Conflict(
-                "Server is not currently being transferred.".into(),
-            ))
-        }
-    };
+    let server = state.manager.get(uuid).await?;
     if !server.is_transferring() {
         return Err(AppError::Conflict(
             "Server is not currently being transferred.".into(),
@@ -115,20 +105,26 @@ async fn download_backup(
 
 #[derive(Debug, Deserialize)]
 struct FileQuery {
-    file: String,
+    #[serde(default)]
+    file: Option<String>,
 }
 
-/// GET /download/file?token=...&file=... — stream one file (single-use).
+/// GET /download/file?token=... — stream one file (single-use). The path
+/// comes from the JWT `file_path` claim (wings parity); `?file=` is kept as
+/// a fallback for tokens issued without it.
 async fn download_file(
     State(state): State<DaemonState>,
     Query(query): Query<TokenQuery>,
     Query(file_q): Query<FileQuery>,
 ) -> AppResult<Response> {
-    let (_claims, server) = authorize(state, &query.token, "file-download").await?;
-    let file_path = server.fs.resolve(&file_q.file)?;
-    server.fs.check_denied(&file_q.file)?;
-    let filename = file_q
-        .file
+    let (claims, server) = authorize(state, &query.token, "file-download").await?;
+    let raw = claims
+        .file_path
+        .or(file_q.file)
+        .ok_or_else(|| AppError::BadRequest("no file path in request".into()))?;
+    let file_path = server.fs.resolve(&raw)?;
+    server.fs.check_denied(&raw)?;
+    let filename = raw
         .rsplit('/')
         .next()
         .unwrap_or("file")
@@ -155,10 +151,12 @@ async fn download_file(
 #[derive(Debug, Deserialize)]
 struct UploadQuery {
     token: String,
+    #[serde(default)]
     directory: String,
 }
 
-/// POST /upload/file?token=...&directory=... — multipart upload (files[]).
+/// POST /upload/file?token=...&directory=... — multipart upload under the
+/// `files` field name (wings parity). `directory` is optional.
 async fn upload_file(
     State(state): State<DaemonState>,
     Query(query): Query<UploadQuery>,
@@ -170,12 +168,13 @@ async fn upload_file(
     let daemon = state.config.read().await.clone();
     let max_bytes = daemon.api.upload_limit.saturating_mul(1024 * 1024);
 
+    let mut uploaded = 0usize;
     while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| AppError::BadRequest(format!("multipart error: {e}")))?
     {
-        if field.name() != Some("files[]") {
+        if field.name() != Some("files") && field.name() != Some("files[]") {
             continue;
         }
         let name = field
@@ -194,12 +193,16 @@ async fn upload_file(
         {
             collected.extend_from_slice(&chunk);
             if max_bytes > 0 && collected.len() as u64 > max_bytes {
-                return Err(AppError::PayloadTooLarge);
+                return Err(AppError::BadRequest(format!(
+                    "File {name} is larger than the maximum file upload size of {} MB.",
+                    daemon.api.upload_limit
+                )));
             }
         }
 
         let path = format!("{}/{}", query.directory.trim_matches('/'), name);
         server.fs.write(&path, &collected)?;
+        uploaded += 1;
 
         state.activity.push(
             crate::models::Activity::new(&server.uuid.to_string(), "server:file.uploaded")
@@ -213,7 +216,13 @@ async fn upload_file(
         );
     }
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    if uploaded == 0 {
+        return Err(AppError::BadRequest(
+            "No files were found on the request body.".into(),
+        ));
+    }
+
+    Ok(StatusCode::OK.into_response())
 }
 
 /// POST /api/transfers — destination node endpoint for server transfers.
