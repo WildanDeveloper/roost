@@ -43,6 +43,7 @@ impl ServerManager {
     pub async fn list(&self) -> Vec<Arc<Server>> {
         self.servers.read().await.values().cloned().collect()
     }
+    #[allow(dead_code)]
 
     pub async fn contains(&self, uuid: Uuid) -> bool {
         self.servers.read().await.contains_key(&uuid)
