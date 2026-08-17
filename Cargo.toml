@@ -50,6 +50,7 @@ chrono = { version = "0.4", features = ["serde"] }
 sha1 = "0.10"
 sha2 = "0.10"
 url = "2"
+ipnet = "2"
 
 # --- File ops: archive, listing, disk usage ---
 tar = "0.4"

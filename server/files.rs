@@ -131,6 +131,15 @@ pub fn rel(&self, abs: &Path) -> String {
     pub fn read(&self, path: &str) -> AppResult<Vec<u8>> {
         let p = self.resolve(path)?;
         self.check_denied(path)?;
+        // Wings refuses to read named pipes (FIFOs) — they can block or
+        // dump unbounded data.
+        let meta = fs::symlink_metadata(&p)
+            .map_err(|e| AppError::BadRequest(format!("cannot stat {path}: {e}")))?;
+        if !meta.is_file() {
+            return Err(AppError::BadRequest(format!(
+                "refusing to read {path}: not a regular file"
+            )));
+        }
         fs::read(&p).map_err(|e| AppError::BadRequest(format!("cannot read {path}: {e}")))
     }
 

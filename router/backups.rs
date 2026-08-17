@@ -374,16 +374,222 @@ async fn restore_backup(
     Path(backup_uuid): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> AppResult<Response> {
-    if payload.adapter != "wings" {
-        return Err(AppError::NotImplemented("only the wings backup adapter is implemented".into()));
+    match payload.adapter.as_str() {
+        "wings" => {
+            let srv = server.0.clone();
+            tokio::spawn(async move {
+                run_restore(srv, backup_uuid, payload.truncate_directory).await;
+            });
+        }
+        "s3" => {
+            if payload.download_url.is_empty() {
+                return Err(AppError::BadRequest(
+                    "The download_url field is required when the backup adapter is set to S3.".into(),
+                ));
+            }
+            // SSRF validation before anything else (wings validateBackupDownloadUrl).
+            let allowlist = {
+                let daemon = server.daemon.read().await.clone();
+                daemon.system.backups.restore_host_allowlist
+            };
+            if let Err(e) = validate_backup_download_url(&payload.download_url, &allowlist) {
+                return Err(AppError::BadRequest(e));
+            }
+            let srv = server.0.clone();
+            let url = payload.download_url.clone();
+            tokio::spawn(async move {
+                run_s3_restore(srv, backup_uuid, &url, payload.truncate_directory).await;
+            });
+        }
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "invalid backup adapter: {other} (expected \"wings\" or \"s3\")"
+            )));
+        }
     }
 
-    let srv = server.0.clone();
-    tokio::spawn(async move {
-        run_restore(srv, backup_uuid, payload.truncate_directory).await;
-    });
-
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// S3 restore: download the archive from the presigned URL (SSRF-safe
+/// HTTP client), verify content type, then restore like a local backup.
+async fn run_s3_restore(
+    server: Arc<crate::server::Server>,
+    backup_uuid: Uuid,
+    download_url: &str,
+    truncate: bool,
+) {
+    server.publish(ServerEvent::DaemonMessage(
+        "(restoring): backup selected; stopping server...".to_string(),
+    ));
+
+    if server.is_running() {
+        let _ = server.power_stop(30).await;
+    }
+
+    let result = (async {
+        if truncate {
+            server.fs.truncate_directory()?;
+        }
+
+        let client = backup_restore_http_client()?;
+        let resp = client.get(download_url).send().await.map_err(|e| {
+            if e.is_redirect() {
+                anyhow::anyhow!("The provided backup link redirects too many times.")
+            } else if e.is_timeout() {
+                anyhow::anyhow!("The provided backup link timed out.")
+            } else {
+                anyhow::anyhow!("The provided backup link returned an invalid response: {e}")
+            }
+        })?;
+        if resp.status() != reqwest::StatusCode::OK {
+            return Err(anyhow::anyhow!(
+                "The provided backup link returned an invalid response status: {}",
+                resp.status()
+            ));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if !is_supported_backup_restore_content_type(&content_type) {
+            return Err(anyhow::anyhow!(
+                "The provided backup link is not a supported content type. \"{content_type}\" is not application/x-gzip."
+            ));
+        }
+
+        // Stream the archive into the server directory (wings streams from
+        // the response body directly).
+        let bytes = resp.bytes().await.map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
+        let daemon = server.daemon.read().await.clone();
+        let tmp = daemon.tmp_dir().join(format!("restore-{backup_uuid}.tar.gz"));
+        std::fs::write(&tmp, &bytes)?;
+        let result = server.fs.decompress_archive(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        result?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    if let Err(e) = &result {
+        tracing::error!(uuid = %backup_uuid, error = %e, "s3 restore failed");
+        server.publish(ServerEvent::DaemonMessage(format!("(restoring): failed: {e}")));
+    } else {
+        server.publish(ServerEvent::DaemonMessage("(restoring): completed".to_string()));
+    }
+
+    server.publish(ServerEvent::BackupRestoreCompleted(
+        serde_json::json!({
+            "uuid": backup_uuid,
+            "successful": result.is_ok(),
+        })
+        .to_string(),
+    ));
+
+    let _ = server
+        .panel
+        .read()
+        .await
+        .post_backup_restore_status(backup_uuid, result.is_ok())
+        .await;
+}
+
+/// Block private/internal destinations on backup restore downloads
+/// (wings `validateBackupDownloadUrl`). Returns the error message.
+fn validate_backup_download_url(raw: &str, allowlist: &[String]) -> Result<(), String> {
+    let parsed = match url::Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return Err("The provided backup link is not a valid URL.".into()),
+    };
+    let host = parsed.host_str().unwrap_or_default();
+    if host.is_empty() {
+        return Err("The provided backup link is not a valid URL.".into());
+    }
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("The provided backup link must use HTTP or HTTPS.".into());
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_blocked_backup_restore_ip(host, ip, allowlist) {
+            return Err("The provided backup link resolves to a blocked address.".into());
+        }
+    }
+    Ok(())
+}
+
+fn is_blocked_backup_restore_ip(host: &str, ip: std::net::IpAddr, allowlist: &[String]) -> bool {
+    let allowed = allowlist.iter().any(|entry| {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return false;
+        }
+        if entry.eq_ignore_ascii_case(host) {
+            return true;
+        }
+        if let Ok(addr) = entry.parse::<std::net::IpAddr>() {
+            if addr == ip {
+                return true;
+            }
+        }
+        if let Ok(cidr) = entry.parse::<ipnet::IpNet>() {
+            if cidr.contains(&ip) {
+                return true;
+            }
+        }
+        false
+    });
+    if allowed {
+        return false;
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || is_private_addr(ip)
+        || is_link_local_addr(ip)
+}
+
+fn is_private_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.octets()[0] == 10
+                || (v4.octets()[0] == 172 && (16..=31).contains(&v4.octets()[1]))
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 168)
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])) // CGNAT
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            matches!(seg[0], 0xfc00 | 0xfd00 | 0xfe80..=0xfebf) // ULA + link-local
+                || seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 1 // ::1 handled by loopback
+        }
+    }
+}
+
+fn is_link_local_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[0] == 169 && v4.octets()[1] == 254,
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// HTTP client with redirect limiting for backup restore downloads.
+fn backup_restore_http_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot build http client: {e}")))
+}
+
+fn is_supported_backup_restore_content_type(value: &str) -> bool {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_lowercase();
+    matches!(media_type.as_str(), "application/x-gzip" | "application/gzip")
 }
 
 async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, truncate: bool) {
@@ -440,10 +646,18 @@ async fn delete_backup(
 ) -> AppResult<Response> {
     let daemon = server.daemon.read().await.clone();
     let archive = daemon.backup_dir().join(format!("{backup_uuid}.tar.gz"));
-    if !archive.exists() {
-        return Err(AppError::ServerNotFound);
+    let meta = match std::fs::symlink_metadata(&archive) {
+        Ok(m) => m,
+        Err(_) => return Err(AppError::ServerNotFound),
+    };
+    if meta.is_dir() {
+        return Err(AppError::BadRequest("invalid archive, is directory".into()));
     }
-    std::fs::remove_file(&archive)
-        .map_err(|e| AppError::BadRequest(format!("cannot delete backup: {e}")))?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    // Wings treats a backup that vanished between locate and delete as a
+    // success, so ignore NotFound here.
+    match std::fs::remove_file(&archive) {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(e) => Err(AppError::BadRequest(format!("cannot delete backup: {e}"))),
+    }
 }
