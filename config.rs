@@ -402,6 +402,36 @@ impl Config {
         }
     }
 
+    /// Write a logrotate configuration for the daemon log file, mirroring
+    /// wings EnableLogRotation: only when enabled, /etc/logrotate.d exists
+    /// and a config for the daemon is not already present.
+    pub fn enable_log_rotation(&self) -> AppResult<()> {
+        if !self.system.enable_log_rotate {
+            return Ok(());
+        }
+        let logrotate_dir = std::path::Path::new("/etc/logrotate.d");
+        let Ok(meta) = std::fs::metadata(logrotate_dir) else {
+            return Ok(());
+        };
+        if !meta.is_dir() {
+            return Ok(());
+        }
+        let conf = logrotate_dir.join("roost");
+        if std::fs::metadata(&conf).is_ok() {
+            return Ok(());
+        }
+        let log_file = self.log_dir().join("roost.log");
+        let contents = format!(
+            "{} {{\n    size 10M\n    compress\n    delaycompress\n    dateext\n    maxage 7\n    missingok\n    notifempty\n    postrotate\n        /usr/bin/systemctl kill -s HUP roost.service >/dev/null 2>&1 || true\n    endscript\n}}\n",
+            log_file.display()
+        );
+        std::fs::write(&conf, contents).map_err(|e| {
+            AppError::Config(format!("failed to write logrotate config: {e}"))
+        })?;
+        tracing::info!("no log rotation configuration found: added /etc/logrotate.d/roost");
+        Ok(())
+    }
+
     /// Create all directories the daemon needs and verify Docker access.
     pub fn ensure_directories(&self) -> AppResult<()> {
         for dir in [

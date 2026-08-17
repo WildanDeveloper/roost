@@ -32,13 +32,24 @@ async fn main() -> anyhow::Result<()> {
     let config_path = std::env::var("ROOST_CONFIG").unwrap_or_else(|_| "/etc/pterodactyl/config.yml".into());
     let config = Config::load(&config_path)?;
     config.ensure_directories()?;
+    config.enable_log_rotation()?;
 
     let filter = if config.debug {
         "roost=debug,tower_http=debug".to_string()
     } else {
         "roost=info,tower_http=info".to_string()
     };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // Mirror wings: also log to {log_directory}/roost.log (logrotate handles
+    // rotation via the generated /etc/logrotate.d/roost config).
+    let log_dir = config.log_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::never(&log_dir, "roost.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(non_blocking)
+        .init();
 
     tracing::info!("roost starting (config: {config_path})");
 

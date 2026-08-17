@@ -94,7 +94,11 @@ impl Server {
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot write install script: {e}")))?;
         tracing::info!(uuid = %self.uuid, path = %script_path.display(), "install script staged");
 
-        // 3. Pull the installer image (fall back to local copy).
+        // 3. Pull the installer image (fall back to local copy). Wings
+        // publishes a daemon message while the pull runs (listeners.go).
+        self.publish(ServerEvent::DaemonMessage(
+            "Pulling Docker container image, this could take a few minutes to complete...".to_string(),
+        ));
         if let Err(e) = self.docker.pull_image(&script.container_image, &daemon.docker).await {
             tracing::warn!(uuid = %self.uuid, image = %script.container_image, error = %e, "could not pull installer image");
         }
