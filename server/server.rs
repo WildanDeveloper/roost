@@ -95,6 +95,10 @@ pub struct Server {
     pub ws_connections: AtomicUsize,
     /// Last crash time for wings-style crash detection.
     last_crash: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// True while a server transfer is in progress.
+    pub transferring: AtomicBool,
+    /// Handle of the background transfer task (outgoing), for cancel.
+    transfer_task: tokio::sync::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 /// GET /api/servers and GET /api/servers/:id response shape.
@@ -135,6 +139,8 @@ impl Server {
             stats_running: AtomicBool::new(false),
             ws_connections: AtomicUsize::new(0),
             last_crash: tokio::sync::Mutex::new(None),
+            transferring: AtomicBool::new(false),
+            transfer_task: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -574,7 +580,7 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     /// Push a daemon-originated console line (crash notices, etc).
-    async fn publish_daemon_message(&self, msg: String) {
+    pub async fn publish_daemon_message(&self, msg: String) {
         self.publish(ServerEvent::DaemonMessage(msg));
     }
 
@@ -629,6 +635,25 @@ pub async fn disk_bytes(&self) -> u64 {
         let resources = cfg.build.as_container_resources(&daemon.docker, false);
         drop(cfg);
         self.docker.update_resources(&self.uuid.to_string(), &resources).await
+    }
+
+    pub fn is_transferring(&self) -> bool {
+        self.transferring.load(Ordering::SeqCst)
+    }
+
+    pub fn set_transferring(&self, value: bool) {
+        self.transferring.store(value, Ordering::SeqCst);
+    }
+
+    /// Track the outgoing transfer task so DELETE can abort it.
+    pub async fn set_transfer_task(&self, handle: Option<tokio::task::AbortHandle>) {
+        *self.transfer_task.lock().await = handle;
+    }
+
+    pub async fn cancel_transfer_task(&self) {
+        if let Some(handle) = self.transfer_task.lock().await.take() {
+            handle.abort();
+        }
     }
 
     /// Kill the process and remove the container (+ data dir optionally).

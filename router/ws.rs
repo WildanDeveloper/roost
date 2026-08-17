@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::Response;
@@ -40,9 +41,11 @@ struct InboundMessage {
 async fn ws_route(
     ws: WebSocketUpgrade,
     headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     State(state): State<DaemonState>,
     Path(server_uuid): Path<Uuid>,
 ) -> AppResult<Response> {
+    let client_ip = addr.ip().to_string();
     let config = state.config.read().await.clone();
 
     // Origin must match the panel location or allowed_origins ("*" ok).
@@ -63,7 +66,7 @@ async fn ws_route(
         return Err(AppError::BadRequest("Too many open websocket connections.".into()));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, server)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, server, client_ip)))
 }
 
 /// Send one protocol message.
@@ -91,7 +94,12 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-async fn handle_socket(mut socket: WebSocket, state: DaemonState, server: Arc<Server>) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: DaemonState,
+    server: Arc<Server>,
+    client_ip: String,
+) {
     server.ws_connections.fetch_add(1, Ordering::SeqCst);
 
     let mut authenticated: Option<Authed> = None;
@@ -173,6 +181,7 @@ async fn handle_socket(mut socket: WebSocket, state: DaemonState, server: Arc<Se
                             &mut authenticated,
                             &mut first_auth_done,
                             &mut events_rx,
+                            &client_ip,
                         )
                         .await;
                     }
@@ -203,6 +212,7 @@ async fn handle_inbound(
     authenticated: &mut Option<Authed>,
     first_auth_done: &mut bool,
     events_rx: &mut Option<tokio::sync::broadcast::Receiver<crate::server::events::ServerEvent>>,
+    client_ip: &str,
 ) {
     macro_rules! jwt_error {
         ($msg:expr) => {{
@@ -289,7 +299,8 @@ async fn handle_inbound(
                 "start" if claims.has_permission("control.start") => {
                     state.activity.push(
                         crate::models::Activity::new(&server.uuid.to_string(), "server:power.start")
-                            .with_user(user),
+                            .with_user(user)
+                            .with_ip(client_ip.to_string()),
                     );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_start().await; });
@@ -297,7 +308,8 @@ async fn handle_inbound(
                 "stop" if claims.has_permission("control.stop") => {
                     state.activity.push(
                         crate::models::Activity::new(&server.uuid.to_string(), "server:power.stop")
-                            .with_user(user),
+                            .with_user(user)
+                            .with_ip(client_ip.to_string()),
                     );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_stop(30).await; });
@@ -305,7 +317,8 @@ async fn handle_inbound(
                 "restart" if claims.has_permission("control.restart") => {
                     state.activity.push(
                         crate::models::Activity::new(&server.uuid.to_string(), "server:power.restart")
-                            .with_user(user),
+                            .with_user(user)
+                            .with_ip(client_ip.to_string()),
                     );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_restart(30).await; });
@@ -313,7 +326,8 @@ async fn handle_inbound(
                 "kill" if claims.has_permission("control.stop") => {
                     state.activity.push(
                         crate::models::Activity::new(&server.uuid.to_string(), "server:power.kill")
-                            .with_user(user),
+                            .with_user(user)
+                            .with_ip(client_ip.to_string()),
                     );
                     let srv = server.clone();
                     tokio::spawn(async move { let _ = srv.power_kill().await; });
@@ -329,6 +343,7 @@ async fn handle_inbound(
                 state.activity.push(
                     crate::models::Activity::new(&server.uuid.to_string(), "server:console.command")
                         .with_user(claims.user_uuid.clone())
+                        .with_ip(client_ip.to_string())
                         .with_metadata(serde_json::json!({ "command": command })),
                 );
                 let _ = server.send_command(&command).await;

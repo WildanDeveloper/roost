@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::jwt::Claims;
+use crate::server::events::ServerEvent;
 use crate::state::DaemonState;
 
 pub fn router() -> Router<DaemonState> {
@@ -124,8 +125,10 @@ struct UploadQuery {
 async fn upload_file(
     State(state): State<DaemonState>,
     Query(query): Query<UploadQuery>,
+    axum::extract::connect_info::ConnectInfo(addr): axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>,
     mut multipart: Multipart,
 ) -> AppResult<Response> {
+    let client_ip = addr.ip().to_string();
     let (claims, server) = authorize(state.clone(), &query.token, "file-upload").await?;
     let daemon = state.config.read().await.clone();
     let max_bytes = daemon.api.upload_limit.saturating_mul(1024 * 1024);
@@ -164,6 +167,7 @@ async fn upload_file(
         state.activity.push(
             crate::models::Activity::new(&server.uuid.to_string(), "server:file.uploaded")
                 .with_user(claims.user_uuid.clone())
+                .with_ip(client_ip.clone())
                 .with_metadata(serde_json::json!({
                     "directory": query.directory,
                     "name": name,
@@ -175,6 +179,154 @@ async fn upload_file(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-async fn incoming_transfer() -> AppResult<Response> {
-    Err(AppError::NotImplemented("incoming transfers are not implemented in wings-rs".into()))
+/// POST /api/transfers — destination node endpoint for server transfers.
+/// The sending daemon streams a multipart form: "archive" (tar.gz of the
+/// server data) and "checksum" (sha256 hex of the archive). Auth is a
+/// panel-issued JWT with scope "transfer" and sub = server uuid.
+async fn incoming_transfer(
+    State(state): State<DaemonState>,
+    headers: axum::http::HeaderMap,
+    mut multipart: Multipart,
+) -> AppResult<Response> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::Unauthorized("missing Bearer token".into()))?;
+
+    let secret = state.config.read().await.token.clone();
+    let claims =
+        crate::jwt::parse_token(bearer, secret.as_bytes(), &state.tokens, state.boot_time).await?;
+    if !claims.has_scope("transfer") {
+        return Err(AppError::Unauthorized("token does not have the transfer scope".into()));
+    }
+    let uuid = claims
+        .sub
+        .and_then(|s| Uuid::parse_str(&s).ok())
+        .ok_or_else(|| AppError::Unauthorized("token has no valid server subject".into()))?;
+
+    let server = state.manager.register(uuid).await?;
+    if server.is_transferring() {
+        return Err(AppError::Conflict("A transfer is already in progress for this server.".into()));
+    }
+    server.set_transferring(true);
+
+    let data_dir = server.fs.root().to_path_buf();
+    let daemon = state.config.read().await.clone();
+    let tmp_dir = daemon.tmp_dir();
+    std::fs::create_dir_all(&tmp_dir)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create tmp dir: {e}")))?;
+    let archive_path = tmp_dir.join(format!("{uuid}.transfer.tar.gz"));
+
+    let result = receive_transfer_archive(&mut multipart, &archive_path, &data_dir).await;
+
+    let successful = result.is_ok();
+    if successful {
+        server.publish(ServerEvent::TransferStatus("success".into()));
+        tracing::info!(uuid = %uuid, "incoming transfer completed");
+    } else {
+        let err = result.unwrap_err();
+        tracing::warn!(uuid = %uuid, error = %err, "incoming transfer failed");
+        server.publish(ServerEvent::TransferStatus("failure".into()));
+    }
+
+    server.set_transferring(false);
+    let _ = state
+        .panel
+        .read()
+        .await
+        .post_transfer_status(uuid, successful)
+        .await;
+
+    if !successful {
+        // Mirror wings: drop the server from the manager and delete the
+        // extracted files so a retry starts from a clean slate.
+        let _ = state.manager.remove(uuid).await;
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+    let _ = std::fs::remove_file(&archive_path);
+
+    Ok(StatusCode::OK.into_response())
+}
+
+/// Drain the multipart body: stream "archive" into `archive_path` (hashing
+/// it as we go), then read "checksum" and verify. The extracted payload is
+/// unpacked into `data_dir` (wings ExtractStreamUnsafe).
+async fn receive_transfer_archive(
+    multipart: &mut Multipart,
+    archive_path: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> AppResult<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = std::fs::File::create(archive_path)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create archive: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut got_archive = false;
+    let mut checksum: Option<String> = None;
+
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        AppError::BadRequest(format!("transfer multipart error: {e}"))
+    })? {
+        match field.name() {
+            Some("archive") => {
+                let mut chunks = 0usize;
+                while let Some(chunk) = field.chunk().await.map_err(|e| {
+                    AppError::BadRequest(format!("transfer archive interrupted: {e}"))
+                })? {
+                    hasher.update(&chunk);
+                    std::io::Write::write_all(&mut file, &chunk).map_err(|e| {
+                        AppError::Internal(anyhow::anyhow!("cannot write archive: {e}"))
+                    })?;
+                    chunks += chunk.len();
+                }
+                tracing::info!(bytes = chunks, "received transfer archive");
+                got_archive = true;
+            }
+            Some("checksum") => {
+                if !got_archive {
+                    return Err(AppError::BadRequest("archive must be sent before the checksum".into()));
+                }
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|e| {
+                    AppError::BadRequest(format!("transfer checksum interrupted: {e}"))
+                })? {
+                    buf.extend_from_slice(&chunk);
+                }
+                checksum = Some(String::from_utf8_lossy(&buf).trim().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if !got_archive {
+        return Err(AppError::BadRequest("missing archive part".into()));
+    }
+    let expected = checksum.ok_or_else(|| AppError::BadRequest("missing checksum part".into()))?;
+    let actual = hex_lower(&hasher.finalize());
+    if expected != actual {
+        return Err(AppError::BadRequest(format!(
+            "archive checksum mismatch: expected {expected}, got {actual}"
+        )));
+    }
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create data dir: {e}")))?;
+    let gz = std::fs::File::open(archive_path)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot open archive: {e}")))?;
+    let decoder = flate2::read::GzDecoder::new(gz);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(data_dir)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot extract archive: {e}")))?;
+    Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

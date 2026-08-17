@@ -166,6 +166,28 @@ pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::Bac
         .map(|_: serde_json::Value| ())
     }
 
+    /// Validate SFTP credentials against the panel (POST /api/remote/sftp/auth).
+    /// The panel returns the matched server uuid and the user's permissions.
+    pub async fn validate_sftp_credentials(
+        &self,
+        auth_type: &str,
+        username: &str,
+        password: &str,
+        ip: &str,
+        session_id: &[u8],
+        client_version: &[u8],
+    ) -> AppResult<types::SftpAuthResponse> {
+        let body = serde_json::json!({
+            "type": auth_type,
+            "username": username,
+            "password": password,
+            "ip": ip,
+            "session_id": base64_encode(session_id),
+            "client_version": base64_encode(client_version),
+        });
+        self.request(reqwest::Method::POST, "/sftp/auth", Some(&body)).await
+    }
+
     /// Low-level request with retry. Wings retries 5xx and transport
     /// errors with exponential backoff, capped at ~30s; 4xx is permanent.
     async fn request<T: serde::de::DeserializeOwned, B: serde::Serialize>(
@@ -252,4 +274,9 @@ pub fn is_valid_daemon_auth(header: &str, node_id: &str, node_token: &str) -> bo
     let token = parts.next().unwrap_or("");
     let trailing = parts.next();
     !id.is_empty() && !token.is_empty() && trailing.is_none() && id == node_id && token == node_token
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }

@@ -109,8 +109,27 @@ impl ServerManager {
     /// Register a server from POST /api/servers and (optionally) start
     /// the install process asynchronously.
     pub async fn create_remote(&self, uuid: Uuid, start_on_completion: bool) -> AppResult<()> {
-        if self.contains(uuid).await {
-            return Ok(());
+        let server = self.register(uuid).await?;
+
+        // Mirrors wings: the install process always runs; start_on_completion
+        // only controls whether the server is started once it finishes.
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.install(false).await;
+            if start_on_completion {
+                let _ = server.power_start().await;
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Load a server's config from the panel and insert it into the
+    /// manager without starting any install process (used for incoming
+    /// server transfers, mirrors wings installer.New + manager.Add).
+    pub async fn register(&self, uuid: Uuid) -> AppResult<Arc<Server>> {
+        if let Some(server) = self.servers.read().await.get(&uuid) {
+            return Ok(server.clone());
         }
 
         let resp = self.shared.panel.read().await.get_server(uuid).await?;
@@ -124,17 +143,14 @@ impl ServerManager {
         let data_dir = daemon.data_dir(&uuid.to_string());
         let server = Arc::new(Server::new(data, &self.shared, data_dir));
         self.servers.write().await.insert(uuid, server.clone());
+        tracing::info!(uuid = %uuid, "server registered for transfer");
+        Ok(server)
+    }
 
-        // Mirrors wings: the install process always runs; start_on_completion
-        // only controls whether the server is started once it finishes.
-        let server = server.clone();
-        tokio::spawn(async move {
-            server.install(false).await;
-            if start_on_completion {
-                let _ = server.power_start().await;
-            }
-        });
-
+    /// Drop a server from the manager without touching the container or
+    /// its files (used by the incoming transfer failure path).
+    pub async fn remove(&self, uuid: Uuid) -> AppResult<()> {
+        self.servers.write().await.remove(&uuid);
         Ok(())
     }
 

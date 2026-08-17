@@ -7,6 +7,7 @@ mod models;
 mod remote;
 mod router;
 mod server;
+mod sftp;
 mod state;
 
 use std::net::SocketAddr;
@@ -87,6 +88,18 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(activity.clone().flush_task(panel.clone(), interval, count));
     }
 
+    {
+        let cfg = shared.read().await;
+        let bind = format!(
+            "{}:{}",
+            cfg.system.sftp.bind_address,
+            if cfg.system.sftp.bind_port == 0 { 2022 } else { cfg.system.sftp.bind_port }
+        );
+        let data_dir = std::path::PathBuf::from(cfg.system.data.clone());
+        let sftp_server = sftp::server::SftpServer::new(manager.clone(), activity.clone(), &cfg.system.sftp, data_dir)?;
+        tokio::spawn(Arc::new(sftp_server).run(bind));
+    }
+
     let state = DaemonState {
         config: shared.clone(),
         manager,
@@ -110,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
         tracing::info!("roost API listening on https://{addr}");
         axum_server::bind_rustls(addr, tls)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     } else {
         tracing::info!("roost API listening on http://{addr}");

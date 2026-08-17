@@ -68,12 +68,23 @@ pub struct SystemConfig {
     pub crash_detection: CrashDetectionConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SftpConfig {
     pub bind_address: String,
     pub bind_port: u16,
     pub read_only: bool,
+}
+
+impl Default for SftpConfig {
+    fn default() -> Self {
+        // Wings defaults when the daemon config omits the sftp section.
+        Self {
+            bind_address: "0.0.0.0".to_string(),
+            bind_port: 2022,
+            read_only: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

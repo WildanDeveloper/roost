@@ -20,6 +20,8 @@ pub enum ServerEvent {
     DaemonMessage(String),
     /// JSON payload of a completed backup.
     BackupCompleted(String),
+    /// "started" | "success" | "failure" (wings transfer status event).
+    TransferStatus(String),
 }
 
 impl ServerEvent {
@@ -34,6 +36,7 @@ impl ServerEvent {
             ServerEvent::InstallCompleted => "install completed",
             ServerEvent::DaemonMessage(_) => "daemon message",
             ServerEvent::BackupCompleted(_) => "backup completed",
+            ServerEvent::TransferStatus(_) => "transfer status",
         }
     }
 
@@ -48,6 +51,7 @@ impl ServerEvent {
             ServerEvent::InstallStarted | ServerEvent::InstallCompleted => vec![String::new()],
             ServerEvent::DaemonMessage(msg) => vec![msg.clone()],
             ServerEvent::BackupCompleted(payload) => vec![payload.clone()],
+            ServerEvent::TransferStatus(state) => vec![state.clone()],
         }
     }
 

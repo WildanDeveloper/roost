@@ -97,15 +97,8 @@ pub struct SftpAuthRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct SftpAuthResponse {
-    pub server: Option<SftpServerInfo>,
+    pub server: Option<String>,
     pub user: String,
+    #[serde(default)]
     pub permissions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct SftpServerInfo {
-    pub uuid: String,
-    pub data: String,
-    pub configuration: ServerConfig,
 }
