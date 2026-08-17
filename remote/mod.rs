@@ -136,10 +136,25 @@ pub async fn post_archive_status(&self, uuid: Uuid, successful: bool) -> AppResu
 
     /// Fetch the URLs (with tokens) to download a backup archive from the
     /// panel's S3 storage.
-    #[allow(dead_code)]
-pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::BackupParts> {
+    pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::BackupParts> {
         self.request(reqwest::Method::GET, &format!("/backups/{uuid}"), None::<&()>)
             .await
+    }
+
+    /// Fetch presigned upload URLs for an S3 backup
+    /// (`GET /api/remote/backups/{uuid}?size=N`). Mirrors wings
+    /// `GetBackupRemoteUploadURLs`.
+    pub async fn get_backup_remote_upload_urls(
+        &self,
+        uuid: Uuid,
+        size: i64,
+    ) -> AppResult<types::BackupParts> {
+        self.request_query(
+            reqwest::Method::GET,
+            &format!("/backups/{uuid}"),
+            &[("size", size.to_string())],
+        )
+        .await
     }
 
     /// Send a batch of activity events to the panel (POST /api/remote/activity,
@@ -186,6 +201,23 @@ pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::Bac
             "client_version": base64_encode(client_version),
         });
         self.request(reqwest::Method::POST, "/sftp/auth", Some(&body)).await
+    }
+
+    /// Like `request`, but appends URL query parameters (wings passes these
+    /// as q{"key": value}).
+    async fn request_query<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> AppResult<T> {
+        let qs: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let full = format!("{path}{sep}{}", qs.join("&"));
+        self.request(method, &full, None::<&()>).await
     }
 
     /// Low-level request with retry. Wings retries 5xx and transport
