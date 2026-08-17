@@ -66,6 +66,12 @@ pub struct Server {
     pub process_config: RwLock<ProcessConfig>,
     pub suspended: AtomicBool,
     pub installing: AtomicBool,
+    /// True while a server restore is running (blocks power actions, wings
+    /// IsRestoring).
+    pub restoring: AtomicBool,
+    /// Set before an intentional stop/kill so the exit watcher skips crash
+    /// detection (wings sets the ProcessStoppingState first for this).
+    pub intentional_stop: AtomicBool,
 
     pub docker: DockerClient,
     pub fs: Filesystem,
@@ -126,6 +132,8 @@ impl Server {
             process_config: RwLock::new(data.process_configuration.unwrap_or_default()),
             suspended: AtomicBool::new(false),
             installing: AtomicBool::new(false),
+            restoring: AtomicBool::new(false),
+            intentional_stop: AtomicBool::new(false),
             docker: shared.docker.clone(),
             fs: Filesystem::new(data_dir, denylist),
             daemon: shared.daemon.clone(),
@@ -319,16 +327,37 @@ pub async fn disk_bytes(&self) -> u64 {
         } else {
             0.0
         };
+        // wings rounds CPU to 3 decimals (environment/docker/stats.go).
+        let cpu_absolute = (cpu_absolute * 1000.0).round() / 1000.0;
 
         let uptime = self
             .started_at
             .lock()
             .await
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
 
+        // wings calculateDockerMemory: subtract cached/inactive pages so the
+        // panel shows the same numbers the docker CLI does.
+        let raw_usage = stats.memory_stats.usage.unwrap_or(0);
+        let (total_inactive_file, inactive_file) =
+            match &stats.memory_stats.stats {
+                Some(bollard::container::MemoryStatsStats::V1(v)) => {
+                    (v.total_inactive_file, v.inactive_file)
+                }
+                Some(bollard::container::MemoryStatsStats::V2(v)) => (0, v.inactive_file),
+                None => (0, 0),
+            };
+        let memory_bytes = if total_inactive_file > 0 && total_inactive_file < raw_usage {
+            raw_usage - total_inactive_file
+        } else if inactive_file < raw_usage {
+            raw_usage - inactive_file
+        } else {
+            raw_usage
+        };
+
         let usage = ResourceUsage {
-            memory_bytes: stats.memory_stats.usage.unwrap_or(0),
+            memory_bytes,
             memory_limit_bytes: stats.memory_stats.limit.unwrap_or(0),
             cpu_absolute,
             network,
@@ -465,40 +494,101 @@ pub async fn disk_bytes(&self) -> u64 {
 
     // ---- power actions -----------------------------------------------------
 
-    /// Stop the container; afterwards the server is offline.
-    async fn stop_unlocked(&self, wait_seconds: u32) -> AppResult<()> {
+    /// Mirror wings HandlePowerAction guard: no power action (including
+    /// terminate) while installing, transferring or restoring.
+    fn check_power_allowed(&self) -> AppResult<()> {
+        if self.is_installing() {
+            return Err(AppError::Conflict("server is currently installing".into()));
+        }
+        if self.is_transferring() {
+            return Err(AppError::Conflict("server is currently being transferred".into()));
+        }
+        if self.is_restoring() {
+            return Err(AppError::Conflict("server is currently restoring a backup".into()));
+        }
+        Ok(())
+    }
+
+    /// Wings powerLock: TryAcquire when wait == 0, otherwise keep trying up
+    /// to `wait` seconds. Kill bypasses the lock entirely.
+    async fn acquire_power_lock(&self, wait: u32) -> AppResult<tokio::sync::MutexGuard<'_, ()>> {
+        if wait > 0 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(wait.into());
+            loop {
+                if let Ok(guard) = self.power_lock.try_lock() {
+                    return Ok(guard);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppError::Conflict(format!(
+                        "could not acquire lock on power action after {wait} seconds"
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } else {
+            self.power_lock.try_lock().map_err(|_| {
+                AppError::Conflict("failed to acquire exclusive lock for power actions".into())
+            })
+        }
+    }
+
+    /// Stop the container; afterwards the server is offline. Mirrors wings
+    /// Stop + WaitForStop(10min, terminate=true): the request wait_seconds
+    /// only bounds the power lock, never the actual stop.
+    async fn stop_unlocked(&self) -> AppResult<()> {
         let name = self.uuid.to_string();
         let stop = self.process_config.read().await.stop.clone();
 
         match stop.r#type.as_str() {
-            "stop" => {
-                self.docker.stop(&name, wait_seconds).await?;
-            }
             "signal" => {
-                let signal = if stop.value.is_empty() { "SIGTERM" } else { &stop.value };
+                // Wings maps common signals and defaults to SIGKILL.
+                let signal = match stop.value.to_uppercase().as_str() {
+                    "SIGABRT" => "SIGABRT",
+                    "SIGINT" | "C" => "SIGINT",
+                    "SIGTERM" => "SIGTERM",
+                    "SIGKILL" => "SIGKILL",
+                    _ => "SIGKILL",
+                };
                 self.docker.kill(&name, signal).await?;
             }
-            _ => {
-                // command: send the stop command to the console, then wait.
-                if !stop.value.is_empty() {
-                    if let Some(tx) = self.console_tx.read().await.clone() {
+            "command" => {
+                // Only send the stop command if attached; otherwise fall
+                // back to the native docker stop (wings).
+                let attached = self.console_tx.read().await.clone();
+                if let Some(tx) = attached {
+                    if !stop.value.is_empty() {
                         let _ = tx.send(stop.value).await;
                     }
-                }
-                let timed_out = tokio::time::timeout(
-                    Duration::from_secs(wait_seconds.into()),
-                    async {
-                        use futures_util::StreamExt;
-                        let mut wait = self.docker.wait_until_stopped(&name);
-                        let _ = wait.next().await;
-                    },
-                )
-                .await
-                .is_err();
-                if timed_out {
-                    self.docker.kill(&name, "SIGKILL").await?;
+                } else {
+                    self.docker.stop(&name, -1).await?;
                 }
             }
+            _ => {
+                // "stop" (and empty): graceful docker stop, waiting as long
+                // as the container needs (wings uses timeout -1).
+                self.docker.stop(&name, -1).await?;
+            }
+        }
+
+        // WaitForStop: up to 10 minutes for the container to actually stop,
+        // then force-terminate.
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(600),
+            async {
+                use futures_util::StreamExt;
+                let mut wait = self.docker.wait_until_stopped(&name);
+                while let Some(item) = wait.next().await {
+                    if item.is_ok() {
+                        break;
+                    }
+                }
+            },
+        )
+        .await
+        .is_err();
+        if timed_out {
+            tracing::warn!(uuid = %self.uuid, "container stop did not complete in 10 minutes, terminating process");
+            let _ = self.docker.kill(&name, "SIGKILL").await;
         }
         Ok(())
     }
@@ -514,6 +604,15 @@ pub async fn disk_bytes(&self) -> u64 {
         // onBeforeStart: sync configuration from panel.
         if let Err(e) = self.sync_from_panel().await {
             tracing::warn!(uuid = %self.uuid, error = %e, "pre-start sync failed");
+        }
+
+        // onBeforeStart: disallow start when suspended, checked after sync so
+        // we have the most up-to-date information.
+        if self.suspended.load(Ordering::SeqCst) {
+            self.set_state(ServerState::Offline).await;
+            return Err(AppError::BadRequest(
+                "Cannot start or restart a server that is suspended.".into(),
+            ));
         }
 
         // onBeforeStart: check disk space before boot (wings HasSpaceErr).
@@ -590,7 +689,13 @@ pub async fn disk_bytes(&self) -> u64 {
             drop(wait);
             watcher.set_state(ServerState::Offline).await;
             watcher.stats_running.store(false, Ordering::SeqCst);
-            tokio::spawn(Server::handle_server_crash(watcher, code));
+            // Intentional stops mark the Stopping state first (wings); only
+            // unexpected exits reach crash detection.
+            if watcher.intentional_stop.swap(false, Ordering::SeqCst) {
+                tracing::info!(uuid = %name, "server stopped intentionally");
+            } else {
+                tokio::spawn(Server::handle_server_crash(watcher, code));
+            }
         });
         tracing::info!(uuid = %self.uuid, "server started");
         Ok(())
@@ -690,33 +795,33 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     pub async fn power_start(self: &Arc<Self>) -> AppResult<()> {
-        let _guard = self.power_lock.lock().await;
-        if self.is_installing() {
-            return Err(AppError::Conflict("server is currently installing or restoring".into()));
-        }
-        if self.suspended.load(Ordering::SeqCst) {
-            return Err(AppError::BadRequest("server is suspended".into()));
-        }
+        self.check_power_allowed()?;
+        let _guard = self.acquire_power_lock(0).await?;
         self.clone().start_unlocked().await
     }
 
     pub async fn power_stop(&self, wait_seconds: u32) -> AppResult<()> {
-        let _guard = self.power_lock.lock().await;
+        self.check_power_allowed()?;
+        let _guard = self.acquire_power_lock(wait_seconds).await?;
         if !self.is_running() {
             return Ok(());
         }
+        self.intentional_stop.store(true, Ordering::SeqCst);
         self.set_state(ServerState::Stopping).await;
-        let result = self.stop_unlocked(wait_seconds).await;
+        let result = self.stop_unlocked().await;
         self.set_state(ServerState::Offline).await;
         result
     }
 
     /// Kill the container immediately. Wings bypasses the power lock for
-    /// kill actions so stuck servers can always be terminated.
+    /// kill actions so stuck servers can always be terminated (but the
+    /// installing/transferring/restoring guards still apply).
     pub async fn power_kill(&self) -> AppResult<()> {
+        self.check_power_allowed()?;
         if !self.is_running() {
             return Ok(());
         }
+        self.intentional_stop.store(true, Ordering::SeqCst);
         self.set_state(ServerState::Stopping).await;
         let result = self.docker.kill(&self.uuid.to_string(), "SIGKILL").await;
         self.set_state(ServerState::Offline).await;
@@ -724,8 +829,10 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     pub async fn power_restart(self: &Arc<Self>, wait_seconds: u32) -> AppResult<()> {
-        let _guard = self.power_lock.lock().await;
-        self.stop_unlocked(wait_seconds).await?;
+        self.check_power_allowed()?;
+        let _guard = self.acquire_power_lock(wait_seconds).await?;
+        self.intentional_stop.store(true, Ordering::SeqCst);
+        self.stop_unlocked().await?;
         self.clone().start_unlocked().await
     }
 
@@ -771,6 +878,14 @@ pub async fn disk_bytes(&self) -> u64 {
         self.transferring.store(value, Ordering::SeqCst);
     }
 
+    pub fn is_restoring(&self) -> bool {
+        self.restoring.load(Ordering::SeqCst)
+    }
+
+    pub fn set_restoring(&self, value: bool) {
+        self.restoring.store(value, Ordering::SeqCst);
+    }
+
     /// Track the outgoing transfer task so DELETE can abort it.
     pub async fn set_transfer_task(&self, handle: Option<tokio::task::AbortHandle>) {
         *self.transfer_task.lock().await = handle;
@@ -812,7 +927,11 @@ pub async fn disk_bytes(&self) -> u64 {
         self.publish(ServerEvent::Deleted);
         self.cancel_transfer_task().await;
         crate::router::downloader::cancel_for_server(self.uuid).await;
-        let _ = self.power_kill().await;
+        // Bypass power guards: panel-initiated cleanup must always work.
+        self.intentional_stop.store(true, Ordering::SeqCst);
+        self.set_state(ServerState::Stopping).await;
+        let _ = self.docker.kill(&self.uuid.to_string(), "SIGKILL").await;
+        self.set_state(ServerState::Offline).await;
         self.docker.remove(&self.uuid.to_string()).await?;
         self.docker.remove(&format!("{}_installer", self.uuid)).await?;
         if remove_data {

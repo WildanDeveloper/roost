@@ -536,6 +536,7 @@ async fn run_s3_restore(
     if server.is_running() {
         let _ = server.power_stop(30).await;
     }
+    server.set_restoring(true);
 
     let result = (async {
         if truncate {
@@ -597,6 +598,8 @@ async fn run_s3_restore(
         })
         .to_string(),
     ));
+
+    server.set_restoring(false);
 
     let _ = server
         .panel
@@ -710,6 +713,7 @@ async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, trun
     if server.is_running() {
         let _ = server.power_stop(30).await;
     }
+    server.set_restoring(true);
 
     let daemon = server.daemon.read().await.clone();
     let archive = daemon.backup_dir().join(format!("{backup_uuid}.tar.gz"));
@@ -740,6 +744,8 @@ async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, trun
         })
         .to_string(),
     ));
+
+    server.set_restoring(false);
 
     let _ = server
         .panel

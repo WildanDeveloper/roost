@@ -382,9 +382,9 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
             .map_err(AppError::Docker)
     }
 
-    pub async fn stop(&self, name: &str, timeout: u32) -> AppResult<()> {
+    pub async fn stop(&self, name: &str, timeout: i64) -> AppResult<()> {
         let options = StopContainerOptions {
-            t: timeout as i64,
+            t: timeout,
         };
         self.inner
             .stop_container(name, Some(options))

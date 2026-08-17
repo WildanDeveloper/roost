@@ -8,7 +8,7 @@ pub struct ResourceUsage {
     pub memory_limit_bytes: u64,
     pub cpu_absolute: f64,
     pub network: NetworkStats,
-    /// seconds
+    /// milliseconds (wings Uptime: `json:"uptime"`, ms)
     pub uptime: u64,
     /// "offline" | "starting" | "running" | "stopping"
     pub state: String,
