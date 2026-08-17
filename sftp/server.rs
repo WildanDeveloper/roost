@@ -155,10 +155,10 @@ impl russh::server::Handler for SshHandler {
         session: &mut SshSession,
     ) -> Result<(), Self::Error> {
         if name != "sftp" {
-            session.channel_failure(channel);
+            let _ = session.channel_failure(channel);
             return Ok(());
         }
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
 
         let Some(authed) = self.authed.take() else {
             return Ok(());

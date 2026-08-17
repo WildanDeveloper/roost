@@ -242,6 +242,7 @@ async fn post_deauthorize_user(
 /// destination's POST /api/transfers. The destination node reports the
 /// outcome to the panel; on failure we notify the panel ourselves.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TransferRequest {
     url: String,
     token: String,
