@@ -26,6 +26,7 @@ pub struct ServerManager {
 }
 
 impl ServerManager {
+    #[allow(dead_code)]
     pub fn new(docker: DockerClient, daemon: SharedConfig, panel: Arc<RwLock<PanelClient>>) -> Self {
         Self {
             shared: ManagerShared { docker, daemon, panel },
