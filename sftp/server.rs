@@ -56,15 +56,17 @@ impl Authed {
 struct SshHandler {
     srv: Arc<SftpServer>,
     peer: SocketAddr,
+    session_token: tokio_util::sync::CancellationToken,
     authed: Option<Authed>,
     session_channel: Option<Channel<russh::server::Msg>>,
 }
 
 impl SshHandler {
-    fn new(srv: Arc<SftpServer>, peer: SocketAddr) -> Self {
+    fn new(srv: Arc<SftpServer>, peer: SocketAddr, session_token: tokio_util::sync::CancellationToken) -> Self {
         Self {
             srv,
             peer,
+            session_token,
             authed: None,
             session_channel: None,
         }
@@ -794,6 +796,9 @@ pub struct SftpServer {
     panel: Arc<tokio::sync::RwLock<crate::remote::PanelClient>>,
     read_only: bool,
     data_dir: PathBuf,
+    /// Active SFTP sessions keyed by server uuid, so installs can abort
+    /// them (mirrors wings `Sftp().CancelAll()`).
+    sessions: tokio::sync::Mutex<HashMap<String, Vec<tokio_util::sync::CancellationToken>>>,
 }
 
 impl SftpServer {
@@ -810,6 +815,7 @@ impl SftpServer {
             panel,
             read_only: cfg.read_only,
             data_dir,
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -845,6 +851,19 @@ impl SftpServer {
         Ok(key)
     }
 
+    /// Abort all active SFTP sessions for a server (used when an install
+    /// starts, since the data directory is about to change under the
+    /// sessions). Mirrors wings `Sftp().CancelAll()`.
+    pub async fn cancel_sessions(&self, uuid: &str) {
+        let tokens: Vec<_> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(uuid).unwrap_or_default()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
     pub async fn run(self: Arc<Self>, bind: String) -> anyhow::Result<()> {
         let host_key = self.load_or_create_host_key()?;
 
@@ -862,11 +881,16 @@ impl SftpServer {
             let (stream, peer) = listener.accept().await?;
             let srv = self.clone();
             let config = config.clone();
+            let session_token = tokio_util::sync::CancellationToken::new();
+            let token_for_task = session_token.clone();
             tokio::spawn(async move {
-                let handler = SshHandler::new(srv, peer);
+                let handler = SshHandler::new(srv, peer, token_for_task);
                 match russh::server::run_stream(config, stream, handler).await {
                     Ok(session) => {
-                        let _ = session.await;
+                        tokio::select! {
+                            _ = session => {}
+                            _ = session_token.cancelled() => {}
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(ip = %peer.ip(), error = %e, "sftp handshake failed");

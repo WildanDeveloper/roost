@@ -25,6 +25,9 @@ impl Server {
         if self.is_running() {
             let _ = self.power_stop(30).await;
         }
+        // Abort any active SFTP sessions; the data directory is about to
+        // change underneath them (mirrors wings `Sftp().CancelAll()`).
+        crate::sftp::cancel_sessions_for(&self.uuid.to_string()).await;
         let _ = self.sync_from_panel().await;
 
         self.publish(ServerEvent::DaemonMessage(

@@ -96,8 +96,14 @@ async fn main() -> anyhow::Result<()> {
             if cfg.system.sftp.bind_port == 0 { 2022 } else { cfg.system.sftp.bind_port }
         );
         let data_dir = std::path::PathBuf::from(cfg.system.data.clone());
-        let sftp_server = sftp::server::SftpServer::new(manager.clone(), activity.clone(), &cfg.system.sftp, data_dir)?;
-        tokio::spawn(Arc::new(sftp_server).run(bind));
+        let sftp_server = Arc::new(sftp::server::SftpServer::new(
+            manager.clone(),
+            activity.clone(),
+            &cfg.system.sftp,
+            data_dir,
+        )?);
+        sftp::set_sftp_server(sftp_server.clone());
+        tokio::spawn(sftp_server.run(bind));
     }
 
     let state = DaemonState {
