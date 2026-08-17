@@ -170,13 +170,15 @@ pub async fn post_archive_status(&self, uuid: Uuid, successful: bool) -> AppResu
             .map(|_: serde_json::Value| ())
     }
 
-    /// Report the outcome of a server transfer to the panel.
+    /// Report the outcome of a server transfer to the panel. Wings posts to
+    /// /servers/{uuid}/transfer/{success|failure} with no body.
     #[allow(dead_code)]
     pub async fn post_transfer_status(&self, uuid: Uuid, successful: bool) -> AppResult<()> {
+        let state = if successful { "success" } else { "failure" };
         self.request(
             reqwest::Method::POST,
-            &format!("/servers/{uuid}/transfer"),
-            Some(&types::StatusMessage { successful }),
+            &format!("/servers/{uuid}/transfer/{state}"),
+            None::<&serde_json::Value>,
         )
         .await
         .map(|_: serde_json::Value| ())
