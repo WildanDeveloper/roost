@@ -60,6 +60,7 @@ base64 = "0.22"
 bytes = "1"
 russh-sftp = "2.4.0"
 russh = "0.62"
+tokio-util = "0.7.19"
 
 [profile.release]
 lto = true

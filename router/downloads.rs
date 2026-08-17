@@ -1,7 +1,7 @@
-use axum::extract::{Multipart, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 
 use serde::Deserialize;
@@ -20,6 +20,34 @@ pub fn router() -> Router<DaemonState> {
         .route("/upload/file", post(upload_file))
         // Transfer destination endpoint (called by other daemons).
         .route("/api/transfers", post(incoming_transfer))
+        .route(
+            "/api/transfers/:server",
+            delete(delete_incoming_transfer),
+        )
+}
+
+/// Cancel an incoming transfer for a server (panel-initiated). Mirrors
+/// wings `deleteTransfer`: 409 unless a transfer is actually in progress,
+/// otherwise abort it and report the failure to the panel.
+async fn delete_incoming_transfer(
+    State(state): State<DaemonState>,
+    Path(uuid): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    let server = match state.manager.get(uuid).await {
+        Ok(server) => server,
+        Err(_) => {
+            return Err(AppError::Conflict(
+                "Server is not currently being transferred.".into(),
+            ))
+        }
+    };
+    if !server.is_transferring() {
+        return Err(AppError::Conflict(
+            "Server is not currently being transferred.".into(),
+        ));
+    }
+    server.cancel_incoming_transfer();
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +238,7 @@ async fn incoming_transfer(
         return Err(AppError::Conflict("A transfer is already in progress for this server.".into()));
     }
     server.set_transferring(true);
+    let cancel = server.fresh_incoming_cancel().await;
 
     let data_dir = server.fs.root().to_path_buf();
     let daemon = state.config.read().await.clone();
@@ -218,7 +247,12 @@ async fn incoming_transfer(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create tmp dir: {e}")))?;
     let archive_path = tmp_dir.join(format!("{uuid}.transfer.tar.gz"));
 
-    let result = receive_transfer_archive(&mut multipart, &archive_path, &data_dir).await;
+    let result = tokio::select! {
+        r = receive_transfer_archive(&mut multipart, &archive_path, &data_dir) => r,
+        _ = cancel.cancelled() => {
+            Err(AppError::Internal(anyhow::anyhow!("incoming transfer cancelled")))
+        }
+    };
 
     let successful = result.is_ok();
     if successful {
@@ -231,6 +265,7 @@ async fn incoming_transfer(
     }
 
     server.set_transferring(false);
+    server.clear_incoming_cancel();
     let _ = state
         .panel
         .read()

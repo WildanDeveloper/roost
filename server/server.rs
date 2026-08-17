@@ -99,6 +99,7 @@ pub struct Server {
     pub transferring: AtomicBool,
     /// Handle of the background transfer task (outgoing), for cancel.
     transfer_task: tokio::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    incoming_cancel: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 /// GET /api/servers and GET /api/servers/:id response shape.
@@ -141,6 +142,7 @@ impl Server {
             last_crash: tokio::sync::Mutex::new(None),
             transferring: AtomicBool::new(false),
             transfer_task: tokio::sync::Mutex::new(None),
+            incoming_cancel: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -659,6 +661,24 @@ pub async fn disk_bytes(&self) -> u64 {
     /// Track the outgoing transfer task so DELETE can abort it.
     pub async fn set_transfer_task(&self, handle: Option<tokio::task::AbortHandle>) {
         *self.transfer_task.lock().await = handle;
+    }
+
+    /// Fresh cancellation token for an incoming transfer (replaces any
+    /// previous one). The caller drives the transfer with this token.
+    pub async fn fresh_incoming_cancel(&self) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        *self.incoming_cancel.lock().await = Some(token.clone());
+        token
+    }
+
+    pub async fn clear_incoming_cancel(&self) {
+        *self.incoming_cancel.lock().await = None;
+    }
+
+    pub async fn cancel_incoming_transfer(&self) {
+        if let Some(token) = self.incoming_cancel.lock().await.take() {
+            token.cancel();
+        }
     }
 
     pub async fn cancel_transfer_task(&self) {
