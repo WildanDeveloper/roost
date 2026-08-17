@@ -2,13 +2,14 @@ use axum::body::Bytes;
 use axum::extract::Query;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, post, put, delete};
 use axum::Json;
 use axum::Router;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
 use crate::router::middleware::ServerExtractor;
@@ -35,7 +36,11 @@ pub fn router() -> Router<DaemonState> {
         .route("/api/servers/:server/files/chmod", post(chmod))
         .route(
             "/api/servers/:server/files/pull",
-            get(pull_status).post(post_pull).delete(cancel_pull),
+            get(pull_status).post(post_pull),
+        )
+        .route(
+            "/api/servers/:server/files/pull/:download",
+            delete(cancel_pull),
         )
 }
 
@@ -240,21 +245,36 @@ struct PullRequest {
     foreground: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct PullStatusResponse {
-    downloads: Vec<serde_json::Value>,
+async fn pull_status(
+    server: ServerExtractor,
+) -> Json<serde_json::Value> {
+    let downloads: Vec<super::downloader::DownloadInfo> = super::downloader::by_server(server.uuid)
+        .await
+        .into_iter()
+        .map(|d| super::downloader::DownloadInfo {
+            identifier: d.identifier.clone(),
+            progress: d.progress(),
+        })
+        .collect();
+    Json(serde_json::json!({ "downloads": downloads }))
 }
 
-async fn pull_status() -> Json<PullStatusResponse> {
-    Json(PullStatusResponse { downloads: vec![] })
-}
-
-async fn cancel_pull() -> AppResult<Response> {
+async fn cancel_pull(
+    server: ServerExtractor,
+    axum::extract::Path((_server_uuid, download)): axum::extract::Path<(String, String)>,
+) -> AppResult<Response> {
+    if let Some(dl) = super::downloader::by_id(&download).await {
+        if dl.server_uuid == server.uuid {
+            dl.cancel();
+            super::downloader::untrack(&download).await;
+        }
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// POST /api/servers/:id/files/pull — download a URL into the server.
-/// Includes the SSRF guard wings has (no private/loopback targets).
+/// Mirrors wings router_server_files.go postServerPullRemoteFile: max 3
+/// concurrent downloads per server, SSRF guard, foreground/background mode.
 async fn post_pull(
     server: ServerExtractor,
     Json(payload): Json<PullRequest>,
@@ -273,6 +293,20 @@ async fn post_pull(
         return Err(AppError::BadRequest("invalid file name".into()));
     }
 
+    // Mirror wings: check disk space before starting the download.
+    if !server.has_space_available().await {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "not enough disk space to download this file"
+        )));
+    }
+
+    // Do not allow more than three simultaneous remote file downloads at once.
+    if super::downloader::count_for_server(server.uuid).await >= super::downloader::MAX_PER_SERVER {
+        return Err(AppError::BadRequest(
+            "This server has reached its limit of 3 simultaneous remote file downloads at once. Please wait for one to complete before trying again.".into(),
+        ));
+    }
+
     validate_download_url(&payload.url).await?;
 
     // Download into a temp file, then move into place (atomic-ish).
@@ -282,29 +316,102 @@ async fn post_pull(
             .map_err(|e| AppError::BadRequest(format!("cannot create directory: {e}")))?;
     }
 
+    let dl = super::downloader::track(
+        server.uuid,
+        payload.url.clone(),
+        file_name.clone(),
+        directory.clone(),
+    )
+    .await;
+    tracing::info!(
+        server = %server.uuid,
+        download_id = %dl.identifier,
+        file = %dl.file_name,
+        dir = %dl.directory,
+        "starting pull of remote file to disk"
+    );
+
+    let task_server = server.0.clone();
+    let dl_clone = dl.clone();
+    let url_clone = payload.url.clone();
+    let file_name_clone = file_name.clone();
+    let dest_clone = dest.clone();
+    let run = async move {
+        let result = run_download(&dest_clone, &url_clone, &file_name_clone, &dl_clone)
+            .await;
+        let _ = super::downloader::untrack(&dl_clone.identifier);
+        result
+    };
+
+    if payload.foreground {
+        let result = run.await;
+        match result {
+            Ok(()) => {
+                let stat = task_server.fs.stat(&dest)?;
+                Ok(JsonValue(json!(stat)).into_response())
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        let url = dl.url.clone();
+        let identifier = dl.identifier.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run.await {
+                tracing::warn!(url = %url, error = %e, "background pull failed");
+            }
+        });
+        Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "identifier": identifier }))).into_response())
+    }
+}
+
+/// Perform the actual HTTP download to `dest`, tracking progress on `dl`.
+async fn run_download(
+    dest: &std::path::Path,
+    url: &str,
+    file_name: &str,
+    dl: &Arc<super::downloader::Download>,
+) -> AppResult<()> {
+    use tokio::io::AsyncWriteExt;
+    let cancel = dl.child_token();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     let mut resp = client
-        .get(&payload.url)
+        .get(url)
         .send()
         .await
         .map_err(|e| AppError::BadRequest(format!("download failed: {e}")))?;
     if !resp.status().is_success() {
         return Err(AppError::BadRequest(format!("remote returned {}", resp.status())));
     }
+    let total = resp.content_length().unwrap_or(0);
 
-    let mut out = std::fs::File::create(&dest)
+    let mut out = tokio::fs::File::create(dest)
+        .await
         .map_err(|e| AppError::BadRequest(format!("cannot create {file_name}: {e}")))?;
+    let mut written: u64 = 0;
     while let Some(chunk) = resp.chunk().await.map_err(|e| AppError::BadRequest(format!("download interrupted: {e}")))? {
-        use std::io::Write;
+        if cancel.is_cancelled() {
+            drop(out);
+            let _ = std::fs::remove_file(dest);
+            return Err(AppError::BadRequest("download cancelled".into()));
+        }
+        use tokio::io::AsyncWriteExt;
         out.write_all(&chunk)
+            .await
             .map_err(|e| AppError::BadRequest(format!("write failed: {e}")))?;
+        written += chunk.len() as u64;
+        if total > 0 {
+            dl.set_progress(written as f64 / total as f64);
+        } else {
+            dl.set_progress(1.0);
+        }
     }
-
-    let stat = server.fs.stat(&dest)?;
-    Ok(JsonValue(json!(stat)).into_response())
+    out.flush().await.map_err(|e| AppError::BadRequest(format!("flush failed: {e}")))?;
+    drop(out);
+    dl.set_progress(1.0);
+    Ok(())
 }
 
 /// Blocks private/loopback/link-local targets (SSRF). Never accepts non

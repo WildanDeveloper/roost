@@ -1,4 +1,5 @@
 pub mod backups;
+pub mod downloader;
 pub mod downloads;
 pub mod files;
 pub mod middleware;

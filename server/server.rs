@@ -779,6 +779,7 @@ pub async fn disk_bytes(&self) -> u64 {
         }
         self.publish(ServerEvent::Deleted);
         self.cancel_transfer_task().await;
+        crate::router::downloader::cancel_for_server(self.uuid).await;
         let _ = self.power_kill().await;
         self.docker.remove(&self.uuid.to_string()).await?;
         self.docker.remove(&format!("{}_installer", self.uuid)).await?;

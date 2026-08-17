@@ -81,7 +81,7 @@ impl Filesystem {
             .any(|entry| entry == &normalized || path.contains(entry))
     }
 
-    fn check_denied(&self, path: &str) -> AppResult<()> {
+    pub fn check_denied(&self, path: &str) -> AppResult<()> {
         if self.is_denied(path) {
             Err(AppError::BadRequest(format!("path is denied by the file denylist: {path}")))
         } else {

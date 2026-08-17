@@ -96,10 +96,13 @@ async fn download_backup(
         return Err(AppError::ServerNotFound);
     }
 
-    let bytes = std::fs::read(&archive)
+    // Stream the file in chunks instead of loading it into memory.
+    let file = tokio::fs::File::open(&archive)
+        .await
         .map_err(|e| AppError::BadRequest(format!("cannot read backup: {e}")))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
     let filename = format!("{backup_uuid}.tar.gz");
-    let mut resp = bytes.into_response();
+    let mut resp = axum::body::Body::from_stream(stream).into_response();
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
     resp.headers_mut().insert(
@@ -122,7 +125,8 @@ async fn download_file(
     Query(file_q): Query<FileQuery>,
 ) -> AppResult<Response> {
     let (_claims, server) = authorize(state, &query.token, "file-download").await?;
-    let bytes = server.fs.read(&file_q.file)?;
+    let file_path = server.fs.resolve(&file_q.file)?;
+    server.fs.check_denied(&file_q.file)?;
     let filename = file_q
         .file
         .rsplit('/')
@@ -130,7 +134,12 @@ async fn download_file(
         .unwrap_or("file")
         .to_string();
 
-    let mut resp = bytes.into_response();
+    let file = tokio::fs::File::open(&file_path)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("cannot read file: {e}")))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+
+    let mut resp = axum::body::Body::from_stream(stream).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
