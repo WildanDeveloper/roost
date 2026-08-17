@@ -38,6 +38,16 @@ impl DockerClient {
         Ok(Self { inner: docker })
     }
 
+    /// Docker engine version (wings GetDockerInfo).
+    pub async fn engine_version(&self) -> AppResult<bollard::system::Version> {
+        self.inner.version().await.map_err(AppError::Docker)
+    }
+
+    /// Docker engine system information (wings GetDockerInfo).
+    pub async fn engine_info(&self) -> AppResult<bollard::models::SystemInfo> {
+        self.inner.info().await.map_err(AppError::Docker)
+    }
+
     pub async fn ping(&self) -> AppResult<()> {
         self.inner.ping().await.map_err(AppError::Docker)?;
         Ok(())

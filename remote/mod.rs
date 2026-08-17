@@ -136,6 +136,7 @@ pub async fn post_archive_status(&self, uuid: Uuid, successful: bool) -> AppResu
 
     /// Fetch the URLs (with tokens) to download a backup archive from the
     /// panel's S3 storage.
+    #[allow(dead_code)]
     pub async fn get_backup_download_urls(&self, uuid: Uuid) -> AppResult<types::BackupParts> {
         self.request(reqwest::Method::GET, &format!("/backups/{uuid}"), None::<&()>)
             .await

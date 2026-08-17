@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{routing::{get, post}, Json, Router};
@@ -30,15 +30,103 @@ struct SystemInformation {
     version: String,
 }
 
-async fn get_system_information() -> Json<SystemInformation> {
+async fn get_system_information(
+    State(state): State<DaemonState>,
+    Query(query): Query<SystemQuery>,
+) -> Json<serde_json::Value> {
     let uname = nix::sys::utsname::uname().ok();
-    Json(SystemInformation {
+    if query.v == Some(2) {
+        return Json(system_information_v2(&state).await);
+    }
+    Json(serde_json::to_value(SystemInformation {
         architecture: std::env::consts::ARCH.to_string(),
         cpu_count: std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1),
         kernel_version: uname.map(|u| u.release().to_string_lossy().to_string()).unwrap_or_default(),
         os: std::env::consts::OS.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+    }).unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemQuery {
+    v: Option<u8>,
+}
+
+/// `?v=2` full system information (wings system/system.go). Used by the
+/// panel telemetry service.
+async fn system_information_v2(state: &DaemonState) -> serde_json::Value {
+    let mut docker = serde_json::json!({
+        "version": "",
+        "cgroups": {"driver": "", "version": ""},
+        "containers": {"total": 0, "running": 0, "paused": 0, "stopped": 0},
+        "storage": {"driver": "", "filesystem": ""},
+        "runc": {"version": ""},
+    });
+    let mut sys = serde_json::json!({
+        "architecture": std::env::consts::ARCH,
+        "cpu_threads": std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1),
+        "memory_bytes": 0,
+        "kernel_version": nix::sys::utsname::uname().map(|u| u.release().to_string_lossy().to_string()).unwrap_or_default(),
+        "os": os_release_name(),
+        "os_type": std::env::consts::OS,
+    });
+
+    if let Ok(info) = state.manager.shared().docker.engine_info().await {
+        docker["containers"] = serde_json::json!({
+            "total": info.containers.unwrap_or(0),
+            "running": info.containers_running.unwrap_or(0),
+            "paused": info.containers_paused.unwrap_or(0),
+            "stopped": info.containers_stopped.unwrap_or(0),
+        });
+        if let Some(driver) = &info.driver {
+            docker["storage"]["driver"] = serde_json::json!(driver);
+        }
+        for row in info.driver_status.unwrap_or_default() {
+            if row.first().map(|s| s.as_str()) == Some("Backing Filesystem") {
+                if let Some(v) = row.get(1) {
+                    docker["storage"]["filesystem"] = serde_json::json!(v);
+                }
+            }
+        }
+        docker["cgroups"]["driver"] = serde_json::json!(
+            info.cgroup_driver.map(|d| d.to_string()).unwrap_or_default()
+        );
+        docker["cgroups"]["version"] = serde_json::json!(
+            info.cgroup_version.map(|v| v.to_string()).unwrap_or_default()
+        );
+        if let Some(mem) = info.mem_total {
+            sys["memory_bytes"] = serde_json::json!(mem);
+        }
+    }
+
+    if let Ok(version) = state.manager.shared().docker.engine_version().await {
+        if let Some(v) = &version.version {
+            docker["version"] = serde_json::json!(v);
+        }
+        for component in version.components.unwrap_or_default() {
+            if component.name == "runc" {
+                docker["runc"]["version"] = serde_json::json!(component.version);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "docker": docker,
+        "system": sys,
     })
+}
+
+/// Pretty name from /etc/os-release (fallback NAME, then docker's).
+fn os_release_name() -> String {
+    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+        for line in content.lines() {
+            if let Some(v) = line.strip_prefix("PRETTY_NAME=").or_else(|| line.strip_prefix("NAME=")) {
+                return v.trim_matches('"').to_string();
+            }
+        }
+    }
+    std::env::consts::OS.to_string()
 }
 
 /// POST /api/update — the panel pushes a full config.yml replacement.

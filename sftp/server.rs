@@ -56,7 +56,7 @@ impl Authed {
 struct SshHandler {
     srv: Arc<SftpServer>,
     peer: SocketAddr,
-    session_token: tokio_util::sync::CancellationToken,
+    _session_token: tokio_util::sync::CancellationToken,
     authed: Option<Authed>,
     session_channel: Option<Channel<russh::server::Msg>>,
 }
@@ -66,7 +66,7 @@ impl SshHandler {
         Self {
             srv,
             peer,
-            session_token,
+            _session_token: session_token,
             authed: None,
             session_channel: None,
         }

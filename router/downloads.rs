@@ -46,7 +46,7 @@ async fn delete_incoming_transfer(
             "Server is not currently being transferred.".into(),
         ));
     }
-    server.cancel_incoming_transfer();
+    server.cancel_incoming_transfer().await;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -265,7 +265,7 @@ async fn incoming_transfer(
     }
 
     server.set_transferring(false);
-    server.clear_incoming_cancel();
+    server.clear_incoming_cancel().await;
     let _ = state
         .panel
         .read()
