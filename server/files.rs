@@ -315,18 +315,22 @@ pub fn disk_available(&self) -> u64 {
         Ok(hex::encode(digest.as_slice()))
     }
 
-    /// Walk the data directory applying an ignore list (newline separated,
-    /// matching the panel's ignore patterns). Used for backups.
+    /// Walk the data directory applying a gitignore-style ignore list
+    /// (wings parses the panel's ignore patterns with go-gitignore). Only
+    /// regular files and symlinks are returned; sockets are skipped
+    /// (archive/tar does not support them) and ignored directories are
+    /// pruned entirely. Used for backups.
     pub fn walk_files(&self, ignore: &str) -> Vec<PathBuf> {
-        let patterns: Vec<&str> = ignore.split('\n').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let patterns = crate::server::gitignore::compile(ignore);
         let mut out = Vec::new();
         for entry in WalkDir::new(&self.root).into_iter().filter_entry(|e| {
             let rel = e.path().strip_prefix(&self.root).unwrap_or(e.path());
-            let rel_str = rel.to_string_lossy();
-            !patterns.iter().any(|p| rel_str.starts_with(p))
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            !crate::server::gitignore::matches_path(&patterns, &rel_str)
         }) {
             if let Ok(entry) = entry {
-                if entry.file_type().is_file() {
+                let ft = entry.file_type();
+                if ft.is_file() || ft.is_symlink() {
                     out.push(entry.into_path());
                 }
             }

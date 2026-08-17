@@ -2,6 +2,7 @@ pub mod activity;
 pub mod console;
 pub mod events;
 pub mod files;
+pub mod gitignore;
 pub mod install;
 pub mod manager;
 pub mod server;

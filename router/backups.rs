@@ -1,3 +1,4 @@
+use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
 
 use axum::extract::Path;
@@ -125,27 +126,136 @@ async fn run_backup(server: Arc<crate::server::Server>, backup_uuid: Uuid, ignor
     }
 }
 
-/// Build the gzipped tar archive of the server data directory.
+/// Build the gzipped tar archive of the server data directory. Mirrors
+/// wings archive.go: symlinks are stored as links (not followed), sockets
+/// are skipped, the compression level comes from system.backups
+/// compression_level, and writes are throttled by system.backups
+/// write_limit (MiB/s) when configured.
 async fn create_archive(
     server: &crate::server::Server,
     archive_path: &std::path::Path,
     ignore: &str,
 ) -> std::io::Result<()> {
+    let daemon = server.daemon.read().await.clone();
+    let compression_level = daemon.system.backups.compression_level.clone();
+    let write_limit = daemon.system.backups.write_limit;
+    drop(daemon);
+
     let file = std::fs::File::create(archive_path)?;
+    let writer: ArchiveWriter = if write_limit > 0 {
+        ArchiveWriter::Throttled(ThrottledWriter::new(file, write_limit))
+    } else {
+        ArchiveWriter::Plain(file)
+    };
+
+    let level = match compression_level.as_str() {
+        "none" => flate2::Compression::none(),
+        "best_compression" => flate2::Compression::best(),
+        _ => flate2::Compression::new(1),
+    };
     let gz = flate2::GzBuilder::new()
         .filename("backup.tar.gz")
-        .write(file, flate2::Compression::new(1));
+        .write(writer, level);
     let mut tar = tar::Builder::new(gz);
+    tar.follow_symlinks(false);
 
     for path in server.fs.walk_files(ignore) {
         let rel = path.strip_prefix(server.fs.root()).unwrap_or(&path);
         if rel.as_os_str().is_empty() {
             continue;
         }
+        // Skip sockets (archive/tar does not support them).
+        if let Ok(ft) = std::fs::symlink_metadata(&path) {
+            if ft.file_type().is_socket() {
+                continue;
+            }
+        }
         tar.append_path_with_name(&path, rel)?;
     }
     let gz = tar.into_inner()?;
     gz.finish()?.sync_all()
+}
+
+/// Either the raw archive file or a throttled wrapper around it.
+enum ArchiveWriter {
+    Plain(std::fs::File),
+    Throttled(ThrottledWriter<std::fs::File>),
+}
+
+impl std::io::Write for ArchiveWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(f) => f.write(buf),
+            Self::Throttled(t) => t.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(f) => f.flush(),
+            Self::Throttled(t) => t.flush(),
+        }
+    }
+}
+
+impl ArchiveWriter {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(f) => f.sync_all(),
+            Self::Throttled(t) => t.inner.sync_all(),
+        }
+    }
+}
+
+/// Token-bucket write throttle (system.backups.write_limit MiB/s), mirroring
+/// wings' ratelimit writer around the archive file.
+struct ThrottledWriter<W: std::io::Write> {
+    inner: W,
+    limit_bytes_per_sec: u64,
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl<W: std::io::Write> ThrottledWriter<W> {
+    fn new(inner: W, limit_mib_per_sec: i64) -> Self {
+        Self {
+            inner,
+            limit_bytes_per_sec: limit_mib_per_sec.max(1) as u64 * 1024 * 1024,
+            tokens: 0.0,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for ThrottledWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.limit_bytes_per_sec as f64)
+            .min(self.limit_bytes_per_sec as f64);
+        let mut written = 0;
+        while written < buf.len() {
+            if self.tokens < 1.0 {
+                let missing = 1.0 - self.tokens;
+                let wait = missing / self.limit_bytes_per_sec as f64;
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+                self.tokens += wait * self.limit_bytes_per_sec as f64;
+            }
+            let take = (self.tokens as usize).max(1).min(buf.len() - written);
+            let n = self.inner.write(&buf[written..written + take])?;
+            self.tokens -= n as f64;
+            written += n;
+            if n == 0 {
+                break;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// S3 adapter: build the archive locally, stream it to the panel-provided
