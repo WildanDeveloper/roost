@@ -61,6 +61,9 @@ impl Server {
         }
 
         self.installing.store(false, Ordering::SeqCst);
+
+        // Post-install: ensure server is in offline state (wings does this).
+        self.set_state(crate::server::ServerState::Offline).await;
     }
 
     async fn run_install_script(self: &Arc<Self>) -> AppResult<()> {
@@ -130,7 +133,16 @@ impl Server {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let log_file = std::fs::File::create(&log_path).ok();
+        let mut log_file = std::fs::File::create(&log_path).ok();
+
+        // Write install metadata header (wings writes UUID, image, entrypoint, env vars).
+        if let Some(ref mut file) = log_file {
+            let _ = writeln!(file, "─────────────────────────────────────────────────");
+            let _ = writeln!(file, "Server UUID: {}", self.uuid);
+            let _ = writeln!(file, "Image: {}", script.container_image);
+            let _ = writeln!(file, "Entrypoint: {}", script.entrypoint);
+            let _ = writeln!(file, "─────────────────────────────────────────────────");
+        }
 
         // 6. Stream output to websockets + the log file.
         if let Ok(attach) = self.docker.attach(&installer_name).await {

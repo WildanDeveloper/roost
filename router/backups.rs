@@ -417,6 +417,14 @@ async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, trun
         server.publish(ServerEvent::DaemonMessage("(restoring): completed".to_string()));
     }
 
+    server.publish(ServerEvent::BackupRestoreCompleted(
+        serde_json::json!({
+            "uuid": backup_uuid,
+            "successful": result.is_ok(),
+        })
+        .to_string(),
+    ));
+
     let _ = server
         .panel
         .read()

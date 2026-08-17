@@ -20,6 +20,10 @@ pub enum ServerEvent {
     DaemonMessage(String),
     /// JSON payload of a completed backup.
     BackupCompleted(String),
+    /// Backup restore completed.
+    BackupRestoreCompleted(String),
+    /// Server deleted event (panel cleanup).
+    Deleted,
     /// "started" | "success" | "failure" (wings transfer status event).
     TransferStatus(String),
 }
@@ -36,6 +40,8 @@ impl ServerEvent {
             ServerEvent::InstallCompleted => "install completed",
             ServerEvent::DaemonMessage(_) => "daemon message",
             ServerEvent::BackupCompleted(_) => "backup completed",
+            ServerEvent::BackupRestoreCompleted(_) => "backup restore completed",
+            ServerEvent::Deleted => "server deleted",
             ServerEvent::TransferStatus(_) => "transfer status",
         }
     }
@@ -50,7 +56,8 @@ impl ServerEvent {
             ServerEvent::Stats(usage) => vec![serde_json::to_string(usage).unwrap_or_default()],
             ServerEvent::InstallStarted | ServerEvent::InstallCompleted => vec![String::new()],
             ServerEvent::DaemonMessage(msg) => vec![msg.clone()],
-            ServerEvent::BackupCompleted(payload) => vec![payload.clone()],
+            ServerEvent::BackupCompleted(payload) | ServerEvent::BackupRestoreCompleted(payload) => vec![payload.clone()],
+            ServerEvent::Deleted => vec![String::new()],
             ServerEvent::TransferStatus(state) => vec![state.clone()],
         }
     }
@@ -62,7 +69,7 @@ impl ServerEvent {
             ServerEvent::InstallOutput(_) | ServerEvent::InstallStarted | ServerEvent::InstallCompleted => {
                 Some("admin.websocket.install")
             }
-            ServerEvent::BackupCompleted(_) => Some("backup.read"),
+            ServerEvent::BackupCompleted(_) | ServerEvent::BackupRestoreCompleted(_) => Some("backup.read"),
             _ => None,
         }
     }

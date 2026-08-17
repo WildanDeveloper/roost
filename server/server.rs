@@ -100,6 +100,8 @@ pub struct Server {
     /// Handle of the background transfer task (outgoing), for cancel.
     transfer_task: tokio::sync::Mutex<Option<tokio::task::AbortHandle>>,
     incoming_cancel: tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// Cached disk usage with last-check timestamp (disk_check_interval).
+    disk_cache: tokio::sync::Mutex<(u64, Instant)>,
 }
 
 /// GET /api/servers and GET /api/servers/:id response shape.
@@ -143,6 +145,7 @@ impl Server {
             transferring: AtomicBool::new(false),
             transfer_task: tokio::sync::Mutex::new(None),
             incoming_cancel: tokio::sync::Mutex::new(None),
+            disk_cache: tokio::sync::Mutex::new((0, Instant::now())),
         }
     }
 
@@ -177,13 +180,30 @@ impl Server {
     }
 
     /// Push raw console bytes; emit complete lines to the log buffer and
-    /// the broadcast channel.
+    /// the broadcast channel. Implements wings console throttling: if
+    /// throttles.enabled, limits lines per period to prevent log flooding.
     pub async fn push_console_bytes(&self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
+        let (throttle_enabled, max_lines, reset_ms) = {
+            let daemon = self.daemon.try_read().map(|c| c.clone()).unwrap_or_default();
+            let t = &daemon.throttles;
+            (t.enabled, t.lines, t.line_reset_interval)
+        };
+        let mut line_count: u64 = 0;
+        let period_start = Instant::now();
         for raw in text.split('\n') {
             let line = raw.trim_end_matches('\r').to_string();
             if line.is_empty() {
                 continue;
+            }
+            if throttle_enabled {
+                line_count += 1;
+                if line_count > max_lines && period_start.elapsed() < Duration::from_millis(reset_ms) {
+                    continue;
+                }
+                if line_count > max_lines {
+                    line_count = 0;
+                }
             }
             {
                 let mut logs = self.logs.write().await;
@@ -231,6 +251,35 @@ pub async fn has_console(&self) -> bool {
     #[allow(dead_code)]
 pub async fn disk_bytes(&self) -> u64 {
         self.fs.disk_usage()
+    }
+
+    /// Cached disk usage; refreshes at most once per disk_check_interval
+    /// seconds (wings `DiskUsage` caching behavior).
+    pub async fn disk_usage_cached(&self) -> u64 {
+        let interval = {
+            let daemon = self.daemon.try_read().map(|c| c.clone()).unwrap_or_default();
+            daemon.system.disk_check_interval
+        };
+        let mut cache = self.disk_cache.lock().await;
+        let refresh = interval == 0 || cache.1.elapsed().as_secs() >= interval;
+        if refresh {
+            cache.0 = self.fs.disk_usage();
+            cache.1 = Instant::now();
+        }
+        cache.0
+    }
+
+    /// Whether the server has space available for its disk limit
+    /// (wings `HasSpaceAvailable`). disk_space <= 0 means unlimited.
+    pub async fn has_space_available(&self) -> bool {
+        let disk_limit = self.config.read().await.build.disk_space;
+        if disk_limit <= 0 {
+            return true;
+        }
+        let available = self.fs.disk_available();
+        let used = self.disk_usage_cached().await;
+        let limit_bytes = (disk_limit as u64) * 1024 * 1024;
+        used < limit_bytes || available > 0
     }
 
     /// One usage snapshot from docker stats.
@@ -285,7 +334,7 @@ pub async fn disk_bytes(&self) -> u64 {
             network,
             uptime,
             state: state.as_str().to_string(),
-            disk_bytes: self.fs.disk_usage(),
+            disk_bytes: self.disk_usage_cached().await,
         };
         *self.usage.write().await = usage.clone();
         Ok(usage)
@@ -304,7 +353,7 @@ pub async fn disk_bytes(&self) -> u64 {
                 if !server.is_running() {
                     server.stats_running.store(false, Ordering::SeqCst);
                     let mut offline = ResourceUsage::offline();
-                    offline.disk_bytes = server.fs.disk_usage();
+                    offline.disk_bytes = server.disk_usage_cached().await;
                     *server.usage.write().await = offline.clone();
                     server.publish(ServerEvent::Stats(offline));
                     return;
@@ -455,16 +504,43 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     /// Start the container (assumes the power lock is held).
+    /// Mirrors wings onBeforeStart: sync, disk check, config update, then boot.
     async fn start_unlocked(self: &Arc<Self>) -> AppResult<()> {
         if self.is_running() {
             return Ok(());
         }
         self.set_state(ServerState::Starting).await;
 
+        // onBeforeStart: sync configuration from panel.
+        if let Err(e) = self.sync_from_panel().await {
+            tracing::warn!(uuid = %self.uuid, error = %e, "pre-start sync failed");
+        }
+
+        // onBeforeStart: check disk space before boot (wings HasSpaceErr).
+        if !self.has_space_available().await {
+            tracing::warn!(uuid = %self.uuid, "aborting start, server has run out of disk space");
+            self.set_state(ServerState::Offline).await;
+            return Err(AppError::BadRequest(
+                "Cannot start server, server has run out of disk space.".into(),
+            ));
+        }
+
         std::fs::create_dir_all(self.fs.root())
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create data dir: {e}")))?;
 
-        chown_recursive(self.fs.root(), 1000, 1000);
+        // Configurable UID/GID chown.
+        let (uid, gid) = {
+            let daemon = self.daemon.read().await.clone();
+            let u = &daemon.system.user;
+            if u.rootless.enabled {
+                (u.rootless.container_uid as u32, u.rootless.container_gid as u32)
+            } else if u.uid != 0 && u.gid != 0 {
+                (u.uid as u32, u.gid as u32)
+            } else {
+                (988, 988)
+            }
+        };
+        chown_recursive(self.fs.root(), uid, gid);
 
         let image = self.config.read().await.container.image.clone();
 
@@ -493,6 +569,10 @@ pub async fn disk_bytes(&self) -> u64 {
         self.docker.start(&self.uuid.to_string()).await?;
         *self.started_at.lock().await = Some(Instant::now());
         self.set_state(ServerState::Running).await;
+        // Apply resource limits in-place after boot (wings InSituUpdate).
+        if let Err(e) = self.apply_limits().await {
+            tracing::warn!(uuid = %self.uuid, error = %e, "could not apply resource limits");
+        }
         self.start_stats_loop();
         let name = self.uuid.to_string();
         let watcher = self.clone();
@@ -619,8 +699,9 @@ pub async fn disk_bytes(&self) -> u64 {
         result
     }
 
+    /// Kill the container immediately. Wings bypasses the power lock for
+    /// kill actions so stuck servers can always be terminated.
     pub async fn power_kill(&self) -> AppResult<()> {
-        let _guard = self.power_lock.lock().await;
         if !self.is_running() {
             return Ok(());
         }
@@ -688,7 +769,9 @@ pub async fn disk_bytes(&self) -> u64 {
     }
 
     /// Kill the process and remove the container (+ data dir optionally).
+    /// Publishes DeletedEvent for the panel to clean up.
     pub async fn delete_container(&self, remove_data: bool) -> AppResult<()> {
+        self.publish(ServerEvent::Deleted);
         let _ = self.power_kill().await;
         self.docker.remove(&self.uuid.to_string()).await?;
         self.docker.remove(&format!("{}_installer", self.uuid)).await?;
