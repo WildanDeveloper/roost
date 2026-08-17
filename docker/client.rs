@@ -84,6 +84,58 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
             .unwrap_or(false))
     }
 
+    /// Dedicated bridge network used to force outgoing traffic SNAT to the
+    /// server's default allocation IP (wings ForceOutgoingIP). The network
+    /// is created once per IP and reused across servers.
+    pub async fn ensure_outgoing_network(&self, ip: &str) -> AppResult<()> {
+        let name = outgoing_network_name(ip);
+        match self
+            .inner
+            .inspect_network(&name, None::<InspectNetworkOptions<String>>)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(_) => {}
+        }
+
+        let mut options = HashMap::new();
+        options.insert("encryption".to_string(), "false".to_string());
+        options.insert(
+            "com.docker.network.bridge.default_bridge".to_string(),
+            "false".to_string(),
+        );
+        options.insert(
+            "com.docker.network.host_ipv4".to_string(),
+            ip.to_string(),
+        );
+
+        let options = CreateNetworkOptions::<String> {
+            name: name.clone(),
+            driver: "bridge".to_string(),
+            check_duplicate: true,
+            internal: false,
+            attachable: false,
+            ingress: false,
+            enable_ipv6: false,
+            ipam: Ipam {
+                driver: Some("default".to_string()),
+                config: None,
+                options: None,
+            },
+            options,
+            labels: Default::default(),
+        };
+
+        match self.inner.create_network(options).await {
+            Ok(_) => {
+                tracing::info!(name, ip, "outgoing IP network created");
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Create the daemon bridge network if it does not exist.
     pub async fn ensure_network(&self, net: &DockerNetworkConfig) -> AppResult<()> {
         if !net.name.is_empty() {
@@ -235,6 +287,10 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
     ) -> AppResult<String> {
         let resources = cfg.build.as_container_resources(&daemon.docker, false);
 
+        if let Some(ip) = forced_outgoing_ip(cfg) {
+            self.ensure_outgoing_network(&ip).await?;
+        }
+
         let (config, _host) = build_container_config(
             server_uuid.to_string(),
             cfg,
@@ -270,6 +326,10 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
         network_ip: &str,
     ) -> AppResult<String> {
         let resources = cfg.build.as_container_resources(&daemon.docker, true);
+
+        if let Some(ip) = forced_outgoing_ip(cfg) {
+            self.ensure_outgoing_network(&ip).await?;
+        }
 
         let (config, host) = build_container_config(
             server_uuid.to_string(),
@@ -453,6 +513,37 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
 
 /// Rewrite an allocation IP so it can be bound by the container.
 /// 127.0.0.1 bindings point at the docker network interface instead.
+/// Network name for a forced outgoing IP, e.g. "ip-10-0-0-1"
+    /// (wings: "ip-" + ip with "." and ":" replaced by "-").
+    pub fn outgoing_network_name(ip: &str) -> String {
+        format!("ip-{}", ip.replace('.', "-").replace(':', "-"))
+    }
+
+/// Select the container network mode. When the server has
+/// force_outgoing_ip enabled and a default allocation IP, the dedicated
+/// "ip-<ip>" bridge network is used (wings container.go).
+fn container_network_mode(cfg: &crate::models::ServerConfig, default_mode: &str) -> String {
+    if cfg.allocations.force_outgoing_ip {
+        let ip = cfg.allocations.default.ip.trim();
+        if !ip.is_empty() && ip != "0.0.0.0" {
+            return crate::docker::client::outgoing_network_name(ip);
+        }
+    }
+    default_mode.to_string()
+}
+
+/// The default allocation IP when force_outgoing_ip is set (wings
+/// DefaultMapping).
+pub fn forced_outgoing_ip(cfg: &crate::models::ServerConfig) -> Option<String> {
+    if cfg.allocations.force_outgoing_ip {
+        let ip = cfg.allocations.default.ip.trim();
+        if !ip.is_empty() && ip != "0.0.0.0" {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
 pub fn rewrite_allocation_ip(ip: &str, network_ip: &str) -> String {
     if ip == "127.0.0.1" || ip == "0.0.0.0" {
         network_ip.to_string()
@@ -574,7 +665,7 @@ fn build_container_config(
         cpu_period: resources.cpu_period,
         cpu_shares: resources.cpu_shares,
         cpuset_cpus: resources.cpuset_cpus,
-        network_mode: Some(docker.network.network_mode.clone()),
+        network_mode: Some(container_network_mode(cfg, &docker.network.network_mode)),
         dns: if docker.network.dns.is_empty() {
             None
         } else {
