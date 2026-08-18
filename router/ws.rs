@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::jwt::Claims;
-use crate::router::middleware::RateLimiter;
+use crate::router::middleware::{is_private_origin, RateLimiter};
 use crate::server::Server;
 use crate::state::DaemonState;
 
@@ -49,11 +49,15 @@ async fn ws_route(
     let config = state.config.read().await.clone();
 
     // Origin must match the panel location or allowed_origins ("*" ok).
+    // A private-network origin is only accepted when
+    // allow_cors_private_network is enabled (wings sends the
+    // Access-Control-Request-Private-Network header and validates the
+    // origin address — it never accepts arbitrary http:// origins).
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let panel = config.panel_url();
         let allowed = origin == panel
             || config.allowed_origins.iter().any(|a| a == "*" || a == origin)
-            || (config.allow_cors_private_network && origin.starts_with("http://"));
+            || (config.allow_cors_private_network && is_private_origin(origin));
         if !allowed {
             tracing::warn!(origin, "websocket origin not allowed");
             return Err(AppError::Forbidden("origin is not allowed".into()));

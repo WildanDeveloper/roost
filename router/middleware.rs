@@ -79,17 +79,50 @@ fn header_value_or_wildcard(origin: Option<&str>) -> HeaderValue {
     }
 }
 
-/// Best-effort check whether the request origin is from a private
-/// network (RFC1918 / loopback). Off by default.
-fn is_private_origin(origin: &str) -> bool {
+/// Check whether the request origin is from a private network (RFC1918,
+/// loopback, link-local, CGNAT, ULA, IPv4-mapped). Off by default.
+pub(crate) fn is_private_origin(origin: &str) -> bool {
     let host = match origin.split("://").nth(1) {
         Some(h) => h,
         None => return false,
     };
     let host = host.split('/').next().unwrap_or(host);
-    let ip = host.rsplit(':').next().unwrap_or(host);
-    let private = ["127.", "10.", "192.168."];
-    private.iter().any(|p| ip.starts_with(p)) || ip.starts_with("172.1") || ip == "::1" || ip == "localhost"
+    // Strip a port: "[::1]:2022" and "127.0.0.1:8080" -> host only.
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest).to_string()
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host).to_string()
+    } else {
+        host.to_string()
+    };
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // ::ffff:a.b.c.d is an IPv4-mapped address — evaluate as IPv4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ipv4(&v4);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+        Ok(std::net::IpAddr::V4(v4)) => is_private_ipv4(&v4),
+        Err(_) => false,
+    }
+}
+
+fn is_private_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || (o[0] == 100 && o[1] >> 6 == 1) // 100.64.0.0/10 CGNAT
+        || (o[0] == 198 && (18..=19).contains(&o[1])) // 198.18/15
 }
 
 /// Resolve the `:server` path param and inject the server into the

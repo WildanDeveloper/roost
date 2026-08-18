@@ -147,7 +147,7 @@ struct SshHandler {
     peer: SocketAddr,
     session_id: Vec<u8>,
     client_version: Arc<Mutex<Option<Vec<u8>>>>,
-    _session_token: tokio_util::sync::CancellationToken,
+    session_token: tokio_util::sync::CancellationToken,
     authed: Option<Authed>,
     session_channel: Option<Channel<russh::server::Msg>>,
 }
@@ -164,7 +164,7 @@ impl SshHandler {
             peer,
             session_id: session_id(peer),
             client_version,
-            _session_token: session_token,
+            session_token,
             authed: None,
             session_channel: None,
         }
@@ -216,8 +216,26 @@ impl SshHandler {
                 .map(|r| r.permissions)
                 .unwrap_or_default(),
         });
+        // Track the session under the server uuid so installs can abort it
+        // (wings `Sftp().CancelAll()`); untracked when the connection ends.
+        let uuid = self
+            .authed
+            .as_ref()
+            .map(|a| a.server.clone())
+            .unwrap_or_default();
+        self.srv.register_session(&uuid, self.session_token.clone()).await;
         tracing::info!(ip = %self.peer.ip(), username = user, "sftp credentials accepted");
         Ok(Auth::Accept)
+    }
+}
+
+impl Drop for SshHandler {
+    fn drop(&mut self) {
+        // Fallback cleanup for connections that never opened an SFTP
+        // channel; the channel task also unregisters when it finishes.
+        if let Some(a) = &self.authed {
+            self.srv.unregister_session(&a.server, &self.session_token);
+        }
     }
 }
 
@@ -278,7 +296,13 @@ impl russh::server::Handler for SshHandler {
             self.srv.data_dir.join(&authed.server)
         };
         let handler = SftpFs::new(self.srv.clone(), authed, data_dir);
-        tokio::spawn(russh_sftp::server::run(stream, handler));
+        let srv = self.srv.clone();
+        let uuid = handler.authed.server.clone();
+        let token = self.session_token.clone();
+        tokio::spawn(async move {
+            russh_sftp::server::run(stream, handler).await;
+            srv.unregister_session(&uuid, &token);
+        });
         Ok(())
     }
 }
@@ -515,7 +539,13 @@ impl SftpFsHandler for SftpFs {
                 }
             }
             let path = self.resolve(&filename)?;
+            use nix::fcntl::OFlag;
+            use std::os::unix::fs::OpenOptionsExt;
             let mut opts = std::fs::OpenOptions::new();
+            // O_NOFOLLOW: an open through a symlink must never reach
+            // outside the server data directory (wings opens via unixFS
+            // with NOFOLLOW).
+            opts.custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits());
             opts.read(read).write(write).append(append);
             if create {
                 opts.create(true);
@@ -647,11 +677,25 @@ impl SftpFsHandler for SftpFs {
                 return Err(sr(StatusCode::PermissionDenied, "missing file.update"));
             }
             let p = self.resolve(&path)?;
+            use nix::fcntl::OFlag;
+            use std::os::unix::fs::OpenOptionsExt;
             if let Some(perms) = attrs.permissions {
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(perms)).map_err(io_err)?;
+                // O_NOFOLLOW: chmod through a symlink would hit the link
+                // target outside the data directory (wings Fchmodat via
+                // unixFS on an O_NOFOLLOW fd).
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+                    .open(&p)
+                    .map_err(io_err)?;
+                f.set_permissions(std::fs::Permissions::from_mode(perms)).map_err(io_err)?;
             }
             if let Some(size) = attrs.size {
-                let f = std::fs::OpenOptions::new().write(true).open(&p).map_err(io_err)?;
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+                    .open(&p)
+                    .map_err(io_err)?;
                 f.set_len(size).map_err(io_err)?;
             }
             Ok(status_ok(_id))
@@ -962,10 +1006,45 @@ impl SftpServer {
         let mut pem = Vec::new();
         encode_pkcs8_pem(&key, &mut pem)
             .map_err(|e| anyhow::anyhow!("cannot encode host key: {e}"))?;
-        std::fs::write(&path, &pem)
+        // wings writes the host key with 0600 permissions. The file cannot
+        // exist here (the read branch above would have returned), so
+        // create_new is safe.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("cannot write host key: {e}"))?;
+        f.write_all(&pem)
             .map_err(|e| anyhow::anyhow!("cannot write host key: {e}"))?;
         tracing::info!(path = %path.display(), "generated sftp ed25519 host key");
         Ok(key)
+    }
+
+    /// Track an authenticated SFTP session under its server uuid so
+    /// installs can abort it (wings `Sftp().CancelAll()`).
+    pub async fn register_session(&self, uuid: &str, token: tokio_util::sync::CancellationToken) {
+        self.sessions
+            .lock()
+            .await
+            .entry(uuid.to_string())
+            .or_default()
+            .push(token);
+    }
+
+    /// Stop tracking a session. Idempotent: safe to call from both the
+    /// channel task and the handler Drop (non-blocking try_lock).
+    pub fn unregister_session(&self, uuid: &str, token: &tokio_util::sync::CancellationToken) {
+        if let Ok(mut sessions) = self.sessions.try_lock() {
+            if let Some(v) = sessions.get_mut(uuid) {
+                v.retain(|t| !std::ptr::eq::<tokio_util::sync::CancellationToken>(
+                    &*t as *const _,
+                    token,
+                ));
+            }
+        }
     }
 
     /// Abort all active SFTP sessions for a server (used when an install
