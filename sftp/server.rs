@@ -3,13 +3,18 @@ use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use russh::keys::ssh_key::Algorithm;
 use russh::keys::{encode_pkcs8_pem, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Config as SshConfig, Session as SshSession};
 use russh::{Channel, ChannelId};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode,
@@ -38,6 +43,90 @@ fn valid_username(user: &str) -> bool {
     false
 }
 
+/// Passthrough stream wrapper that records the client's SSH banner (the
+/// first `SSH-2.0-...` line) so it can be forwarded to the panel like
+/// wings does (`conn.ClientVersion()`). All bytes are passed through
+/// unchanged; only the first line is observed.
+struct BannerCapture<S> {
+    inner: S,
+    seen: Vec<u8>,
+    client_version: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl<S> BannerCapture<S> {
+    fn new(inner: S, client_version: Arc<Mutex<Option<Vec<u8>>>>) -> Self {
+        Self {
+            inner,
+            seen: Vec::new(),
+            client_version,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for BannerCapture<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if res.is_ready() {
+            let bytes = &buf.filled()[before..];
+            if self.client_version.lock().unwrap().is_none() {
+                for &b in bytes {
+                    self.seen.push(b);
+                    if self.seen.len() >= 256 || b == b'\n' {
+                        let mut version = std::mem::take(&mut self.seen);
+                        while version.last().is_some_and(|&c| c == b'\n' || c == b'\r') {
+                            version.pop();
+                        }
+                        *self.client_version.lock().unwrap() = Some(version);
+                        break;
+                    }
+                }
+            }
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for BannerCapture<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Per-connection session id, like wings' `conn.SessionID()`. russh does
+/// not expose the SSH exchange hash, so we derive a stable 32-byte hash
+/// from connection-unique inputs (peer, time, connection counter).
+fn session_id(peer: SocketAddr) -> Vec<u8> {
+    static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = Sha256::new();
+    hasher.update(peer.to_string().as_bytes());
+    hasher.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    hasher.finalize().to_vec()
+}
+
 #[derive(Clone)]
 struct Authed {
     server: String,
@@ -56,16 +145,25 @@ impl Authed {
 struct SshHandler {
     srv: Arc<SftpServer>,
     peer: SocketAddr,
+    session_id: Vec<u8>,
+    client_version: Arc<Mutex<Option<Vec<u8>>>>,
     _session_token: tokio_util::sync::CancellationToken,
     authed: Option<Authed>,
     session_channel: Option<Channel<russh::server::Msg>>,
 }
 
 impl SshHandler {
-    fn new(srv: Arc<SftpServer>, peer: SocketAddr, session_token: tokio_util::sync::CancellationToken) -> Self {
+    fn new(
+        srv: Arc<SftpServer>,
+        peer: SocketAddr,
+        session_token: tokio_util::sync::CancellationToken,
+        client_version: Arc<Mutex<Option<Vec<u8>>>>,
+    ) -> Self {
         Self {
             srv,
             peer,
+            session_id: session_id(peer),
+            client_version,
             _session_token: session_token,
             authed: None,
             session_channel: None,
@@ -82,6 +180,10 @@ impl SshHandler {
             tracing::debug!(username = user, "sftp username format invalid");
             return Ok(Auth::reject());
         }
+        let client_version: Vec<u8> = {
+            let guard = self.client_version.lock().unwrap();
+            guard.clone().unwrap_or_default()
+        };
         let resp = match self
             .srv
             .panel
@@ -91,9 +193,9 @@ impl SshHandler {
                 auth_type,
                 user,
                 password,
-                &self.peer.ip().to_string(),
-                &[],
-                &[],
+                &self.peer.to_string(),
+                &self.session_id,
+                &client_version,
             )
             .await
         {
@@ -884,7 +986,9 @@ impl SftpServer {
             let session_token = tokio_util::sync::CancellationToken::new();
             let token_for_task = session_token.clone();
             tokio::spawn(async move {
-                let handler = SshHandler::new(srv, peer, token_for_task);
+                let client_version = Arc::new(Mutex::new(None));
+                let stream = BannerCapture::new(stream, client_version.clone());
+                let handler = SshHandler::new(srv, peer, token_for_task, client_version);
                 match russh::server::run_stream(config, stream, handler).await {
                     Ok(session) => {
                         tokio::select! {

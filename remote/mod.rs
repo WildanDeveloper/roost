@@ -296,8 +296,21 @@ pub async fn post_archive_status(&self, uuid: Uuid, successful: bool) -> AppResu
             }
             tokio::time::sleep(delay).await;
             delay = std::cmp::min(delay * 2, Duration::from_secs(12));
+            delay += jitter(delay);
         }
     }
+}
+
+/// Small random factor on top of the backoff delay so a burst of failed
+/// panel requests does not pile up in lockstep (wings backoff uses a
+/// 0.5 randomization factor).
+fn jitter(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let frac = (nanos % 50) as u32; // 0..50
+    base.mul_f32(0.01 * frac as f32)
 }
 
 /// Helper used by tests/tools: check auth header format matches what the

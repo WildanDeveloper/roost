@@ -150,20 +150,75 @@ async fn post_update_configuration(
     let mut new_config: Config = serde_json::from_value(value)
         .map_err(|e| AppError::BadRequest(format!("invalid config payload: {e}")))?;
 
-    if new_config.token.is_empty() {
-        return Err(AppError::BadRequest("token must not be empty".into()));
+    // Wings: keep the SSL certificate paths when the panel passes through
+    // the LetsEncrypt defaults, so manual locations are not overwritten.
+    {
+        let existing = state.config.read().await;
+        if new_config.api.ssl.key.starts_with("/etc/letsencrypt/live/") {
+            new_config.api.ssl.key = existing.api.ssl.key.clone();
+        }
+        if new_config.api.ssl.cert.starts_with("/etc/letsencrypt/live/") {
+            new_config.api.ssl.cert = existing.api.ssl.cert.clone();
+        }
+    }
+
+    // Wings ResolveToken(remote=true): a panel push must not carry token
+    // indirection, and environment overrides must match the local value.
+    if new_config.token.contains('$') || new_config.token.starts_with("file://") {
+        return Err(AppError::BadRequest(
+            "config: remote token cannot use token indirection".into(),
+        ));
+    }
+    if new_config.token_id.contains('$') || new_config.token_id.starts_with("file://") {
+        return Err(AppError::BadRequest(
+            "config: remote token ID cannot use token indirection".into(),
+        ));
+    }
+    if let Ok(t) = std::env::var("WINGS_TOKEN") {
+        if !t.is_empty() && t.trim() != new_config.token {
+            return Err(AppError::BadRequest(
+                "config: remote token does not match environment override".into(),
+            ));
+        }
+    }
+    if let Ok(t) = std::env::var("WINGS_TOKEN_ID") {
+        if !t.is_empty() && t.trim() != new_config.token_id {
+            return Err(AppError::BadRequest(
+                "config: remote token ID does not match environment override".into(),
+            ));
+        }
+    }
+
+    // Refuse to apply a token we could never authenticate against.
+    if new_config.token.is_empty() || new_config.token_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "config: refusing to apply an update with an empty authentication token".into(),
+        ));
     }
 
     // Keep the path we loaded from.
     let path = state.config.read().await.path.clone();
 
-    // Persist as YAML.
+    // Persist as YAML with 0600 permissions (wings WriteToDisk) so the
+    // daemon token is never world-readable.
     if let Some(path) = &path {
         new_config.path = Some(path.clone());
         let yaml = serde_yaml::to_string(&new_config)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot serialize config: {e}")))?;
-        if let Err(e) = std::fs::write(path, yaml) {
-            return Err(AppError::Internal(anyhow::anyhow!("cannot write {}: {e}", path)));
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot open {}: {e}", path)))?;
+            use std::io::Write;
+            file.write_all(yaml.as_bytes())
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot write {}: {e}", path)))?;
+            file.sync_all()
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot sync {}: {e}", path)))?;
         }
         tracing::info!(path = %path, "new configuration persisted");
     }

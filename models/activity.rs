@@ -7,8 +7,9 @@ use serde_json::Value;
 /// event, metadata, ip, timestamp).
 #[derive(Debug, Clone, Serialize)]
 pub struct Activity {
-    /// UUID of the user that triggered this event, or None for system events.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// UUID of the user that triggered this event, or null for system events
+    /// (wings JsonNullString serializes empty user as `null`).
+    #[serde(default)]
     pub user: Option<String>,
     pub server: String,
     pub event: String,
