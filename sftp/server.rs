@@ -33,12 +33,16 @@ const PERM_CREATE: &str = "file.create";
 const PERM_UPDATE: &str = "file.update";
 const PERM_DELETE: &str = "file.delete";
 
-/// Usernames must at least look like the panel format (`<uuid>.<8 chars>`);
-/// wings applies the same pre-check before hitting the panel API.
+/// Usernames must at least look like the panel format (`<user>.<server>`);
+/// the server part is either the short id (8 hex chars) or the full uuid,
+/// both of which the panel's SftpAuthenticationController resolves.
 fn valid_username(user: &str) -> bool {
     if let Some(idx) = user.rfind('.') {
         let suffix = &user[idx + 1..];
-        return suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit());
+        if suffix.len() == 8 {
+            return suffix.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        return uuid::Uuid::parse_str(suffix).is_ok();
     }
     false
 }
