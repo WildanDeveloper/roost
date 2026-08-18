@@ -997,6 +997,11 @@ impl SftpServer {
                 None,
             )
             .map_err(|e| anyhow::anyhow!("cannot parse host key: {e}"))?;
+            // wings keeps the host key at 0600; an existing key may have
+            // been written with looser permissions before this was
+            // enforced, so normalize them on every load.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             return Ok(key);
         }
 
