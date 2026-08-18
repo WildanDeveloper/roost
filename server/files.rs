@@ -31,6 +31,11 @@ pub struct FileStat {
 pub struct Filesystem {
     root: PathBuf,
     denylist: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    /// Disk limit in bytes; 0 means unlimited (wings `SetDiskLimit`).
+    disk_limit: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// UID/GID new files are chowned to; -1 disables.
+    chown_uid: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    chown_gid: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl Filesystem {
@@ -38,7 +43,28 @@ impl Filesystem {
         Self {
             root,
             denylist: std::sync::Arc::new(std::sync::RwLock::new(denylist)),
+            disk_limit: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            chown_uid: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            chown_gid: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1)),
         }
+    }
+
+    pub fn set_disk_limit(&self, bytes: i64) {
+        self.disk_limit.store(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn max_disk(&self) -> i64 {
+        self.disk_limit.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether `size` more bytes would fit under the disk limit
+    /// (wings `HasSpaceFor`, using the cached usage).
+    pub fn has_space_for(&self, size: i64) -> bool {
+        if self.max_disk() <= 0 {
+            return true;
+        }
+        let used = self.disk_usage();
+        (used as i64) + size <= self.max_disk()
     }
 
     pub fn set_denylist(&self, denylist: Vec<String>) {
@@ -150,7 +176,33 @@ pub fn rel(&self, abs: &Path) -> String {
             fs::create_dir_all(parent)
                 .map_err(|e| AppError::BadRequest(format!("cannot create parent dir: {e}")))?;
         }
-        fs::write(&p, bytes).map_err(|e| AppError::BadRequest(format!("cannot write {path}: {e}")))
+        // Wings Write: the amount of new data must fit before writing.
+        let current = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
+        if !self.has_space_for(bytes.len() as i64 - current) {
+            return Err(AppError::BadRequest(
+                "filesystem: not enough disk space".into(),
+            ));
+        }
+        fs::write(&p, bytes).map_err(|e| AppError::BadRequest(format!("cannot write {path}: {e}")))?;
+        self.chown(&p);
+        Ok(())
+    }
+
+    /// Chown a single path to the container user (wings `chownFile`).
+    pub fn chown(&self, p: &Path) {
+        use std::os::unix::fs::chown as unix_chown;
+        let uid = self.chown_uid.load(std::sync::atomic::Ordering::SeqCst);
+        let gid = self.chown_gid.load(std::sync::atomic::Ordering::SeqCst);
+        if uid >= 0 && gid >= 0 {
+            let _ = unix_chown(p, Some(uid as u32), Some(gid as u32));
+        }
+    }
+
+    /// Set the UID/GID new files are chowned to (wings defaults: the
+    /// configured container user, or 988/988).
+    pub fn set_chown_ids(&self, uid: i32, gid: i32) {
+        self.chown_uid.store(uid, std::sync::atomic::Ordering::SeqCst);
+        self.chown_gid.store(gid, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn create_directory(&self, name: &str, path: &str) -> AppResult<()> {
@@ -251,23 +303,45 @@ pub fn rel(&self, abs: &Path) -> String {
             }
         }
         let arch = newest.ok_or_else(|| AppError::BadRequest("archive was not created".into()))?;
+        // Wings: if the archive does not fit under the limit, remove it and
+        // report a disk space error.
+        let size = fs::metadata(&arch).map(|m| m.len() as i64).unwrap_or(0);
+        if !self.has_space_for(size) {
+            let _ = fs::remove_file(&arch);
+            return Err(AppError::BadRequest(
+                "filesystem: not enough disk space".into(),
+            ));
+        }
         self.stat(&arch)
     }
 
-    /// Decompress a `.tar.gz` archive in `root` into `root`.
+    /// Decompress a `.zip`, `.tar.gz`, `.tar` (or plain `.gz`) archive in
+    /// `root` into `root` (wings `DecompressFile`).
     pub fn decompress(&self, root: &str, file: &str) -> AppResult<()> {
         let base = self.resolve(root)?;
         self.check_denied(file)?;
         let archive = base.join(file);
-        if archive
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e != "gz")
-            .unwrap_or(true)
+        let lower = file.to_lowercase();
+        if !(lower.ends_with(".zip")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar")
+            || lower.ends_with(".gz"))
         {
-            return Err(AppError::BadRequest("only .tar.gz archives can be decompressed".into()));
+            return Err(AppError::BadRequest(
+                "filesystem: unknown archive format".into(),
+            ));
         }
-        uuids::extract(&archive, &base)
+        // Wings SpaceAvailableForDecompression: refuse to start when the
+        // archive's uncompressed contents would exceed the disk limit.
+        if let Ok(total) = uuids::uncompressed_size(&archive) {
+            if !self.has_space_for(total as i64) {
+                return Err(AppError::BadRequest(
+                    "filesystem: not enough disk space".into(),
+                ));
+            }
+        }
+        uuids::extract_user_archive(&archive, &base)
             .map_err(|e| AppError::BadRequest(format!("cannot decompress {file}: {e}")))?;
         Ok(())
     }
@@ -500,6 +574,139 @@ mod uuids {
                     entry.unpack(&dest)?;
                 }
                 Ok(())
+            })
+    }
+
+    /// Whether the file is a tar archive (checks the ustar magic at
+    /// offset 257, like archives.Identify does for wings).
+    fn is_tar(file: &mut std::fs::File) -> std::io::Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut buf = [0u8; 512];
+        file.seek(SeekFrom::Start(0))?;
+        let n = file.read(&mut buf)?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(n >= 262 && &buf[257..262] == b"ustar")
+    }
+
+    /// Total uncompressed size of a .tar.gz/.tar/.zip archive (wings
+    /// `SpaceAvailableForDecompression`). Returns Ok(0) for unknown types.
+    pub fn uncompressed_size(archive: &Path) -> std::io::Result<u64> {
+        let name = archive
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let mut total: u64 = 0;
+
+        if name.ends_with(".zip") {
+            let file = std::fs::File::open(archive)?;
+            let mut zip = zip::ZipArchive::new(file)
+                .map_err(|e| std::io::Error::other(format!("invalid zip: {e}")))?;
+            for i in 0..zip.len() {
+                let entry = zip
+                    .by_index(i)
+                    .map_err(|e| std::io::Error::other(format!("zip entry: {e}")))?;
+                total += entry.size();
+            }
+            return Ok(total);
+        }
+
+        if name.ends_with(".gz") || name.ends_with(".tgz") {
+            let mut file = std::fs::File::open(archive)?;
+            if is_tar(&mut file)? {
+                let gz = flate2::read::GzDecoder::new(file);
+                let mut tar = tar::Archive::new(gz);
+                for entry in tar.entries()?.filter_map(|e| e.ok()) {
+                    total += entry.size();
+                }
+            } else {
+                // Single-file compression: size is the compressed size.
+                total = std::fs::metadata(archive)?.len();
+            }
+            return Ok(total);
+        }
+
+        if name.ends_with(".tar") {
+            let file = std::fs::File::open(archive)?;
+            let mut tar = tar::Archive::new(file);
+            for entry in tar.entries()?.filter_map(|e| e.ok()) {
+                total += entry.size();
+            }
+            return Ok(total);
+        }
+
+        Ok(0)
+    }
+
+    /// Extract a user-facing archive (zip / tar / tar.gz / plain gz) into
+    /// `base`, wing-style: paths are used as-is, symlinks inside tar
+    /// archives are honored, and path traversal is blocked.
+    pub fn extract_user_archive(archive: &Path, base: &Path) -> std::io::Result<()> {
+        let name = archive
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        if name.ends_with(".zip") {
+            let file = std::fs::File::open(archive)?;
+            let mut zip = zip::ZipArchive::new(file)
+                .map_err(|e| std::io::Error::other(format!("invalid zip: {e}")))?;
+            zip.extract(base)
+                .map_err(|e| std::io::Error::other(format!("cannot extract zip: {e}")))?;
+            return Ok(());
+        }
+
+        if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            let file = std::fs::File::open(archive)?;
+            let gz = flate2::read::GzDecoder::new(file);
+            return extract_tar(gz, base);
+        }
+
+        if name.ends_with(".tar") {
+            let file = std::fs::File::open(archive)?;
+            return extract_tar(file, base);
+        }
+
+        if name.ends_with(".gz") {
+            let mut file = std::fs::File::open(archive)?;
+            if is_tar(&mut file)? {
+                let gz = flate2::read::GzDecoder::new(file);
+                return extract_tar(gz, base);
+            }
+            // Single-file compression: write `<name>` minus the .gz suffix.
+            let stripped = archive
+                .file_name()
+                .map(|s| s.to_string_lossy().replace(".gz", ""))
+                .unwrap_or_default();
+            let dest = base.join(stripped);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut decoder = flate2::read::GzDecoder::new(file);
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut decoder, &mut out)?;
+            return Ok(());
+        }
+
+        Err(std::io::Error::other("filesystem: unknown archive format"))
+    }
+
+    fn extract_tar<R: std::io::Read>(reader: R, base: &Path) -> std::io::Result<()> {
+        let mut tar = tar::Archive::new(reader);
+        tar.set_unpack_xattrs(false);
+        tar.set_preserve_permissions(false);
+        tar.entries()?
+            .filter_map(|e| e.ok())
+            .try_for_each(|mut entry| -> std::io::Result<()> {
+                let entry_path = entry.path()?.into_owned();
+                let dest = base.join(&entry_path);
+                // Guard against path traversal inside the archive.
+                if !dest.starts_with(base) {
+                    return Ok(());
+                }
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                entry.unpack(&dest).map(|_| ())
             })
     }
 }

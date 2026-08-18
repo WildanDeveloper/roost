@@ -286,10 +286,29 @@ pub async fn disk_bytes(&self) -> u64 {
         if disk_limit <= 0 {
             return true;
         }
-        let available = self.fs.disk_available();
         let used = self.disk_usage_cached().await;
-        let limit_bytes = (disk_limit as u64) * 1024 * 1024;
-        used < limit_bytes || available > 0
+        used <= (disk_limit as u64) * 1024 * 1024
+    }
+
+    /// Push the disk limit + chown UID/GID into the filesystem (wings
+    /// `SetDiskLimit` / `chownFile`). Called on every panel sync.
+    async fn sync_filesystem_ids(&self) {
+        let (limit, uid, gid) = {
+            let cfg = self.config.read().await;
+            let daemon = self.daemon.read().await.clone();
+            let limit = (cfg.build.disk_space.max(0) as i64) * 1024 * 1024;
+            let u = &daemon.system.user;
+            let ids = if u.rootless.enabled {
+                (u.rootless.container_uid as i32, u.rootless.container_gid as i32)
+            } else if u.uid != 0 && u.gid != 0 {
+                (u.uid as i32, u.gid as i32)
+            } else {
+                (988, 988)
+            };
+            (limit, ids.0, ids.1)
+        };
+        self.fs.set_disk_limit(limit);
+        self.fs.set_chown_ids(uid, gid);
     }
 
     /// One usage snapshot from docker stats.
@@ -379,6 +398,9 @@ pub async fn disk_bytes(&self) -> u64 {
         let server = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            // Wings disk limiter: fires once per boot when usage is over
+            // the limit, then stops the server.
+            let mut disk_limiter_fired = false;
             loop {
                 interval.tick().await;
                 if !server.is_running() {
@@ -390,10 +412,31 @@ pub async fn disk_bytes(&self) -> u64 {
                     return;
                 }
                 if let Ok(usage) = server.snapshot_usage().await {
+                    if !disk_limiter_fired && server.over_disk_limit(usage.disk_bytes) {
+                        disk_limiter_fired = true;
+                        server.publish(ServerEvent::DaemonMessage(
+                            "Server is exceeding the assigned disk space limit, stopping process now.".into(),
+                        ));
+                        server.intentional_stop.store(true, Ordering::SeqCst);
+                        server.set_state(ServerState::Stopping).await;
+                        let name = server.uuid.to_string();
+                        let stop = server.stop_unlocked();
+                        // Wings waits 1 minute before force terminating.
+                        if tokio::time::timeout(Duration::from_secs(60), stop).await.is_err() {
+                            let _ = server.docker.kill(&name, "SIGKILL").await;
+                        }
+                        server.set_state(ServerState::Offline).await;
+                    }
                     server.publish(ServerEvent::Stats(usage));
                 }
             }
         });
+    }
+
+    /// Whether the given disk usage exceeds the server's disk limit.
+    pub fn over_disk_limit(&self, disk_bytes: u64) -> bool {
+        let limit = self.config.try_read().map(|c| c.build.disk_space).unwrap_or(0);
+        limit > 0 && disk_bytes > (limit as u64) * 1024 * 1024
     }
 
     // ---- configuration -----------------------------------------------------
@@ -412,6 +455,7 @@ pub async fn disk_bytes(&self) -> u64 {
         *self.config.write().await = fresh.settings;
         *self.process_config.write().await = fresh.process_configuration.unwrap_or_default();
         self.apply_denylist().await;
+        self.sync_filesystem_ids().await;
         tracing::info!(uuid = %self.uuid, "configuration synced from panel");
 
         // Wings: when a sync marks the server suspended, immediately

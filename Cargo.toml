@@ -57,6 +57,7 @@ regex = "1"
 # --- File ops: archive, listing, disk usage ---
 tar = "0.4"
 flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
 nix = { version = "0.29", features = ["fs", "hostname", "feature"] }
 base64 = "0.22"
