@@ -332,7 +332,7 @@ pub async fn inspect_container(&self, name: &str) -> AppResult<Option<ContainerI
         }
 
         let (config, host) = build_container_config(
-            server_uuid.to_string(),
+            "installer".to_string(),
             cfg,
             &cfg.build,
             resources,
@@ -581,76 +581,93 @@ fn build_container_config(
 ) -> (ContainerConfig<String>, HostConfig) {
     let docker = &daemon.docker;
 
-    // Exposed ports: both tcp and udp for every allocation.
-    let mut exposed_ports = HashMap::new();
-    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-
-    for (ip, port) in cfg.allocations() {
-        let bind_ip = rewrite_allocation_ip(&ip, network_ip);
-        for proto in ["tcp", "udp"] {
-            let key = format!("{port}/{proto}");
-            let binding = PortBinding {
-                host_ip: Some(bind_ip.clone()),
-                host_port: Some(port.to_string()),
-            };
-            port_bindings
-                .entry(key.clone())
-                .or_insert_with(|| Some(vec![]))
-                .as_mut()
-                .unwrap()
-                .push(binding);
-            exposed_ports.insert(key, HashMap::<(), ()>::new());
+    // Wings: the install container gets none of the hardened settings —
+    // no port bindings, no dropped capabilities, no no-new-privileges, no
+    // read-only rootfs, and none of the passwd/machine-id/custom mounts.
+    let (exposed_ports, port_bindings) = if installer {
+        (None, None)
+    } else {
+        let mut exposed_ports = HashMap::new();
+        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+        for (ip, port) in cfg.allocations() {
+            let bind_ip = rewrite_allocation_ip(&ip, network_ip);
+            for proto in ["tcp", "udp"] {
+                let key = format!("{port}/{proto}");
+                let binding = PortBinding {
+                    host_ip: Some(bind_ip.clone()),
+                    host_port: Some(port.to_string()),
+                };
+                port_bindings
+                    .entry(key.clone())
+                    .or_insert_with(|| Some(vec![]))
+                    .as_mut()
+                    .unwrap()
+                    .push(binding);
+                exposed_ports.insert(key, HashMap::<(), ()>::new());
+            }
         }
-    }
+        (Some(exposed_ports), Some(port_bindings))
+    };
 
     let mut labels = HashMap::new();
     labels.insert(LABEL_SERVICE.to_string(), "Pterodactyl".to_string());
-    labels.insert(LABEL_TYPE.to_string(), LABEL_TYPE_SERVER.to_string());
-    labels.insert("pterodactyl.server_uuid".to_string(), cfg.uuid.to_string());
+    labels.insert(
+        LABEL_TYPE.to_string(),
+        if installer {
+            LABEL_TYPE_INSTALLER.to_string()
+        } else {
+            LABEL_TYPE_SERVER.to_string()
+        },
+    );
     for (k, v) in &cfg.labels {
         labels.insert(k.clone(), v.clone());
     }
 
-    let mut mounts = vec![mount(data_dir, "/home/container", false)];
-    // Wings mounts.go: generated /etc/{group,passwd} overrides to work around
-    // UID/GID issues, and a per-server /etc/machine-id.
-    if daemon.system.passwd.enabled {
-        mounts.push(mount(
-            std::path::Path::new(&daemon.system.passwd.directory).join("group").as_path(),
-            "/etc/group",
-            true,
-        ));
-        mounts.push(mount(
-            std::path::Path::new(&daemon.system.passwd.directory).join("passwd").as_path(),
-            "/etc/passwd",
-            true,
-        ));
-    }
-    if daemon.system.machine_id.enabled {
-        mounts.push(mount(
-            std::path::Path::new(&daemon.system.machine_id.directory)
-                .join(cfg.uuid.to_string())
-                .as_path(),
-            "/etc/machine-id",
-            true,
-        ));
-    }
-    for m in &cfg.mounts {
-        let source = std::path::Path::new(&m.source);
-        let allowed = daemon
-            .allowed_mounts
-            .iter()
-            .any(|a| source.starts_with(std::path::Path::new(a)));
-        if !allowed {
-            tracing::warn!(
-                uuid = %cfg.uuid,
-                source = %m.source,
-                "skipping custom server mount, not in list of allowed mount points"
-            );
-            continue;
+    let mounts = if installer {
+        Vec::new()
+    } else {
+        let mut mounts = vec![mount(data_dir, "/home/container", false)];
+        // Wings mounts.go: generated /etc/{group,passwd} overrides to work
+        // around UID/GID issues, and a per-server /etc/machine-id.
+        if daemon.system.passwd.enabled {
+            mounts.push(mount(
+                std::path::Path::new(&daemon.system.passwd.directory).join("group").as_path(),
+                "/etc/group",
+                true,
+            ));
+            mounts.push(mount(
+                std::path::Path::new(&daemon.system.passwd.directory).join("passwd").as_path(),
+                "/etc/passwd",
+                true,
+            ));
         }
-        mounts.push(mount(std::path::Path::new(&m.source), &m.target, m.read_only));
-    }
+        if daemon.system.machine_id.enabled {
+            mounts.push(mount(
+                std::path::Path::new(&daemon.system.machine_id.directory)
+                    .join(cfg.uuid.to_string())
+                    .as_path(),
+                "/etc/machine-id",
+                true,
+            ));
+        }
+        for m in &cfg.mounts {
+            let source = std::path::Path::new(&m.source);
+            let allowed = daemon
+                .allowed_mounts
+                .iter()
+                .any(|a| source.starts_with(std::path::Path::new(a)));
+            if !allowed {
+                tracing::warn!(
+                    uuid = %cfg.uuid,
+                    source = %m.source,
+                    "skipping custom server mount, not in list of allowed mount points"
+                );
+                continue;
+            }
+            mounts.push(mount(std::path::Path::new(&m.source), &m.target, m.read_only));
+        }
+        mounts
+    };
 
     let mut tmpfs = HashMap::new();
     tmpfs.insert(
@@ -688,13 +705,17 @@ fn build_container_config(
         cpu_period: resources.cpu_period,
         cpu_shares: resources.cpu_shares,
         cpuset_cpus: resources.cpuset_cpus,
-        network_mode: Some(container_network_mode(cfg, &docker.network.network_mode)),
+        network_mode: Some(if installer {
+            docker.network.network_mode.clone()
+        } else {
+            container_network_mode(cfg, &docker.network.network_mode)
+        }),
         dns: if docker.network.dns.is_empty() {
             None
         } else {
             Some(docker.network.dns.clone())
         },
-        port_bindings: Some(port_bindings),
+        port_bindings,
         mounts: Some(mounts),
         tmpfs: Some(tmpfs),
         log_config: Some(bollard::models::HostConfigLogConfig {
@@ -705,9 +726,13 @@ fn build_container_config(
                 Some(docker.log_config.config.clone())
             },
         }),
-        security_opt: Some(vec!["no-new-privileges".to_string()]),
-        readonly_rootfs: Some(true),
-        cap_drop: Some(cap_drop),
+        security_opt: if installer {
+            None
+        } else {
+            Some(vec!["no-new-privileges".to_string()])
+        },
+        readonly_rootfs: if installer { Some(false) } else { Some(true) },
+        cap_drop: if installer { None } else { Some(cap_drop) },
         userns_mode: if docker.userns_mode.is_empty() {
             None
         } else {
@@ -726,20 +751,19 @@ fn build_container_config(
         image: Some(cfg.container.image.clone()),
         env: Some(env.to_vec()),
         labels: Some(labels),
-        exposed_ports: Some(exposed_ports),
+        exposed_ports,
         tty: Some(true),
         open_stdin: Some(true),
         attach_stdin: Some(true),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         stdin_once: Some(false),
-        working_dir: Some("/home/container".to_string()),
-        user: Some(container_user(daemon)),
+        working_dir: if installer { None } else { Some("/home/container".to_string()) },
+        user: if installer { None } else { Some(container_user(daemon)) },
         host_config: Some(host_config.clone()),
         ..Default::default()
     };
 
-    let _ = installer;
     (config, host_config)
 }
 

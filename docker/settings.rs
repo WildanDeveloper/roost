@@ -53,7 +53,13 @@ impl ServerBuild {
 
         if installer {
             limit.memory_limit = limit.memory_limit.max(docker.installer_limits.memory);
-            limit.cpu_limit = limit.cpu_limit.max(docker.installer_limits.cpu);
+            // Wings: an unlimited installer CPU limit (0) forces the
+            // container to unlimited regardless of the server's limit.
+            if docker.installer_limits.cpu == 0 {
+                limit.cpu_limit = 0;
+            } else {
+                limit.cpu_limit = limit.cpu_limit.max(docker.installer_limits.cpu);
+            }
         }
 
         let memory_limit = limit.bounded_memory_limit(docker);
@@ -77,7 +83,8 @@ impl ServerBuild {
             memory_reservation: if memory_limit > 0 { Some(limit.memory_limit * 1024 * 1024) } else { None },
             memory_swap: Some(memory_swap),
             oom_kill_disable: Some(limit.oom_disabled),
-            pids_limit: Some(docker.container_pid_limit),
+            // Wings removes the PID limit for installer containers.
+            pids_limit: if installer { None } else { Some(docker.container_pid_limit) },
             blkio_weight: Some(limit.io_weight.clamp(10, 1000) as u16),
             cpu_quota,
             cpu_period,

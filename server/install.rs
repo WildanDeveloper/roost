@@ -30,6 +30,12 @@ impl Server {
         crate::sftp::cancel_sessions_for(&self.uuid.to_string()).await;
         let _ = self.sync_from_panel().await;
 
+        // Wings publishes InstallStarted before running the script (only
+        // when the egg scripts actually run) so the panel can update early.
+        if !self.config.read().await.skip_egg_scripts {
+            self.publish(ServerEvent::InstallStarted);
+        }
+
         self.publish(ServerEvent::DaemonMessage(
             "Starting installation process, this could take a few minutes...".to_string(),
         ));
@@ -50,7 +56,6 @@ impl Server {
             .await;
 
         if successful {
-            self.publish(ServerEvent::InstallCompleted);
             self.publish(ServerEvent::DaemonMessage(
                 "Installation completed successfully.".to_string(),
             ));
@@ -59,6 +64,10 @@ impl Server {
                 "Installation failed; the panel has been notified.".to_string(),
             ));
         }
+
+        // Wings publishes InstallCompleted on success AND failure (the panel
+        // listens for it to stop the "installing" spinner).
+        self.publish(ServerEvent::InstallCompleted);
 
         self.installing.store(false, Ordering::SeqCst);
 
@@ -130,8 +139,6 @@ impl Server {
             )
             .await?;
 
-        self.publish(ServerEvent::InstallStarted);
-
         // 5. Install log file.
         let log_path = daemon.log_dir().join("install").join(format!("{}.log", self.uuid));
         if let Some(parent) = log_path.parent() {
@@ -160,6 +167,21 @@ impl Server {
         tracing::info!(uuid = %self.uuid, "starting installer container");
         self.docker.start(&installer_name).await?;
         tracing::info!(uuid = %self.uuid, "installer container started; waiting for exit");
+
+        // Wings applies the CPU burst to the installer container too
+        // (SetCpuBurst after ContainerStart).
+        if daemon.docker.cpu_burst.enabled {
+            let resources = cfg.build.as_container_resources(&daemon.docker, true);
+            let quota = resources.cpu_quota.unwrap_or(0);
+            crate::docker::cgroup::set_cpu_burst(
+                &self.docker,
+                &installer_name,
+                quota,
+                daemon.docker.cpu_burst.enabled,
+                daemon.docker.cpu_burst.percent,
+            )
+            .await;
+        }
 
         {
             use futures_util::StreamExt;
