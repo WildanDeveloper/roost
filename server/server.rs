@@ -88,8 +88,6 @@ pub struct Server {
     usage: RwLock<ResourceUsage>,
     cpu_prev: Mutex<CpuPrev>,
     started_at: Mutex<Option<Instant>>,
-    /// Fingerprint of the config the current container was created with.
-    container_fingerprint: RwLock<Option<String>>,
 
     /// Serializes power actions for this server.
     power_lock: Mutex<()>,
@@ -99,6 +97,10 @@ pub struct Server {
 
     /// Connected websocket clients (for the connection cap).
     pub ws_connections: AtomicUsize,
+    /// Current websocket cancellation token; new connections hold the token
+    /// they read at connect time, so cancelling swaps in a fresh token and
+    /// aborts every live socket (wings `Websockets().CancelAll()`).
+    pub ws_cancel: tokio::sync::RwLock<tokio_util::sync::CancellationToken>,
     /// Last crash time for wings-style crash detection.
     last_crash: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// True while a server transfer is in progress.
@@ -144,11 +146,11 @@ impl Server {
             usage: RwLock::new(ResourceUsage::offline()),
             cpu_prev: Mutex::new(CpuPrev::default()),
             started_at: Mutex::new(None),
-            container_fingerprint: RwLock::new(None),
             power_lock: Mutex::new(()),
             console_tx: RwLock::new(None),
             stats_running: AtomicBool::new(false),
             ws_connections: AtomicUsize::new(0),
+            ws_cancel: tokio::sync::RwLock::new(tokio_util::sync::CancellationToken::new()),
             last_crash: tokio::sync::Mutex::new(None),
             transferring: AtomicBool::new(false),
             transfer_task: tokio::sync::Mutex::new(None),
@@ -411,6 +413,13 @@ pub async fn disk_bytes(&self) -> u64 {
         *self.process_config.write().await = fresh.process_configuration.unwrap_or_default();
         self.apply_denylist().await;
         tracing::info!(uuid = %self.uuid, "configuration synced from panel");
+
+        // Wings: when a sync marks the server suspended, immediately
+        // disconnect all websocket and SFTP clients.
+        if self.suspended.load(Ordering::SeqCst) {
+            self.cancel_websockets().await;
+            crate::sftp::cancel_sessions_for(&self.uuid.to_string()).await;
+        }
         Ok(())
     }
 
@@ -419,20 +428,13 @@ pub async fn disk_bytes(&self) -> u64 {
         self.fs.set_denylist(denylist);
     }
 
-    /// Fingerprint of the current config; containers are rebuilt when this
-    /// changes between the stored fingerprint and the fresh one.
-    async fn fingerprint(&self) -> String {
-        let cfg = self.config.read().await.clone();
-        let env = self.build_env().await;
-        format!("{:?}|{:?}", cfg, env)
-    }
-
-    async fn container_matches_config(&self) -> bool {
-        let stored = self.container_fingerprint.read().await.clone();
-        match stored {
-            Some(f) => f == self.fingerprint().await,
-            None => false,
-        }
+    /// Wings always destroys and re-creates the container before every boot
+    /// (OnBeforeStart) so synced panel data and mutable image tags are always
+    /// applied and the log file is truncated. `remove` tolerates a missing
+    /// container; `create_container` pulls the image first.
+    async fn ensure_container_fresh(&self) -> AppResult<()> {
+        self.docker.remove(&self.uuid.to_string()).await?;
+        self.create_container().await
     }
 
     /// Environment variables, mirroring wings `GetEnvironmentVariables`:
@@ -473,6 +475,15 @@ pub async fn disk_bytes(&self) -> u64 {
 
     pub fn is_installing(&self) -> bool {
         self.installing.load(Ordering::SeqCst)
+    }
+
+    /// Abort every live websocket (wings `Websockets().CancelAll()`).
+    pub async fn cancel_websockets(&self) {
+        let old = {
+            let mut guard = self.ws_cancel.write().await;
+            std::mem::replace(&mut *guard, tokio_util::sync::CancellationToken::new())
+        };
+        old.cancel();
     }
 
     pub fn api_response(&self) -> ApiResponse {
@@ -643,10 +654,9 @@ pub async fn disk_bytes(&self) -> u64 {
 
         let image = self.config.read().await.container.image.clone();
 
-        if !self.container_matches_config().await {
-            self.docker.remove(&self.uuid.to_string()).await?;
-            self.create_container().await?;
-        }
+        // Always destroy and re-create the container before boot so synced
+        // panel data is applied and logs are truncated (wings OnBeforeStart).
+        self.ensure_container_fresh().await?;
 
         {
             let daemon = self.daemon.read().await.clone();
@@ -729,7 +739,6 @@ pub async fn disk_bytes(&self) -> u64 {
         self.docker
             .create_server_container(self.uuid, &cfg, self.fs.root(), &daemon, &env, &network_ip)
             .await?;
-        *self.container_fingerprint.write().await = Some(self.fingerprint().await);
         Ok(())
     }
 

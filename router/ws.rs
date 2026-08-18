@@ -102,6 +102,10 @@ async fn handle_socket(
 ) {
     server.ws_connections.fetch_add(1, Ordering::SeqCst);
 
+    // Held for the lifetime of the socket; a suspend/sync cancels it and
+    // every connection drops (wings Websockets().CancelAll()).
+    let ws_cancel = server.ws_cancel.read().await.clone();
+
     let mut authenticated: Option<Authed> = None;
     let mut first_auth_done = false;
     let mut events_rx: Option<tokio::sync::broadcast::Receiver<crate::server::events::ServerEvent>> = None;
@@ -121,6 +125,7 @@ async fn handle_socket(
         };
 
         tokio::select! {
+            _ = ws_cancel.cancelled() => break,
             _ = interval.tick() => {
                 if let Some(a) = &authenticated {
                     let exp = a.claims.exp as i64;
