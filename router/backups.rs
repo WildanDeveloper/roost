@@ -502,13 +502,14 @@ async fn restore_backup(
                 let daemon = server.daemon.read().await.clone();
                 daemon.system.backups.restore_host_allowlist
             };
-            if let Err(e) = validate_backup_download_url(&payload.download_url, &allowlist) {
+            if let Err(e) = validate_backup_download_url(&payload.download_url, &allowlist).await {
                 return Err(AppError::BadRequest(e));
             }
             let srv = server.0.clone();
             let url = payload.download_url.clone();
+            let allowlist = allowlist.clone();
             tokio::spawn(async move {
-                run_s3_restore(srv, backup_uuid, &url, payload.truncate_directory).await;
+                run_s3_restore(srv, backup_uuid, &url, payload.truncate_directory, &allowlist).await;
             });
         }
         other => {
@@ -528,13 +529,34 @@ async fn run_s3_restore(
     backup_uuid: Uuid,
     download_url: &str,
     truncate: bool,
+    allowlist: &[String],
 ) {
     server.publish(ServerEvent::DaemonMessage(
         "(restoring): backup selected; stopping server...".to_string(),
     ));
 
+    // wings: restore aborts when the server cannot be stopped (WaitForStop,
+    // 2 minutes) — truncating and extracting over a live process would
+    // corrupt the data.
     if server.is_running() {
-        let _ = server.power_stop(30).await;
+        if let Err(e) = server.power_stop(30).await {
+            tracing::error!(uuid = %backup_uuid, error = %e, "restore aborted: server did not stop");
+            server.publish(ServerEvent::DaemonMessage(format!("(restoring): failed: {e}")));
+            server.publish(ServerEvent::BackupRestoreCompleted(
+                serde_json::json!({
+                    "uuid": backup_uuid,
+                    "successful": false,
+                })
+                .to_string(),
+            ));
+            let _ = server
+                .panel
+                .read()
+                .await
+                .post_backup_restore_status(backup_uuid, false)
+                .await;
+            return;
+        }
     }
     server.set_restoring(true);
 
@@ -543,7 +565,7 @@ async fn run_s3_restore(
             server.fs.truncate_directory()?;
         }
 
-        let client = backup_restore_http_client()?;
+        let client = backup_restore_http_client(allowlist)?;
         let resp = client.get(download_url).send().await.map_err(|e| {
             if e.is_redirect() {
                 anyhow::anyhow!("The provided backup link redirects too many times.")
@@ -571,12 +593,27 @@ async fn run_s3_restore(
             ));
         }
 
-        // Stream the archive into the server directory (wings streams from
-        // the response body directly).
-        let bytes = resp.bytes().await.map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
+        // Stream the archive to a temp file instead of buffering the whole
+        // response in memory (wings streams the response body).
         let daemon = server.daemon.read().await.clone();
         let tmp = daemon.tmp_dir().join(format!("restore-{backup_uuid}.tar.gz"));
-        std::fs::write(&tmp, &bytes)?;
+        let stream_result: Result<(), anyhow::Error> = (async {
+            use futures_util::StreamExt;
+            use tokio::io::AsyncWriteExt;
+            let mut out = tokio::fs::File::create(&tmp).await?;
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
+                out.write_all(&chunk).await?;
+            }
+            out.flush().await?;
+            Ok(())
+        })
+        .await;
+        if let Err(e) = stream_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         let result = server.fs.decompress_archive(&tmp);
         let _ = std::fs::remove_file(&tmp);
         result?;
@@ -610,8 +647,11 @@ async fn run_s3_restore(
 }
 
 /// Block private/internal destinations on backup restore downloads
-/// (wings `validateBackupDownloadUrl`). Returns the error message.
-fn validate_backup_download_url(raw: &str, allowlist: &[String]) -> Result<(), String> {
+/// (wings `validateBackupDownloadUrl`). Unlike wings' per-hop dial-time
+/// blocking, hostnames are resolved here so a DNS name pointing at a
+/// private/local address is rejected before the request is even sent.
+/// Returns the error message.
+async fn validate_backup_download_url(raw: &str, allowlist: &[String]) -> Result<(), String> {
     let parsed = match url::Url::parse(raw) {
         Ok(u) => u,
         Err(_) => return Err("The provided backup link is not a valid URL.".into()),
@@ -624,10 +664,17 @@ fn validate_backup_download_url(raw: &str, allowlist: &[String]) -> Result<(), S
     if scheme != "http" && scheme != "https" {
         return Err("The provided backup link must use HTTP or HTTPS.".into());
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_blocked_backup_restore_ip(host, ip, allowlist) {
-            return Err("The provided backup link resolves to a blocked address.".into());
-        }
+    let ips: Vec<std::net::IpAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => match tokio::net::lookup_host((host, parsed.port_or_known_default().unwrap_or(80)))
+            .await
+        {
+            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+            Err(_) => return Err("The provided backup link could not be resolved.".into()),
+        },
+    };
+    if ips.iter().any(|ip| is_blocked_backup_restore_ip(host, *ip, allowlist)) {
+        return Err("The provided backup link resolves to a blocked address.".into());
     }
     Ok(())
 }
@@ -686,10 +733,40 @@ fn is_link_local_addr(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// HTTP client with redirect limiting for backup restore downloads.
-fn backup_restore_http_client() -> AppResult<reqwest::Client> {
+/// HTTP client for backup restore downloads. Redirects are validated on
+/// every hop against the SSRF blocklist before being followed (wings
+/// blocks at DialContext per hop); a redirect to a blocked address stops
+/// the request.
+fn backup_restore_http_client(allowlist: &[String]) -> AppResult<reqwest::Client> {
+    let allowlist = allowlist.to_vec();
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        let url = attempt.url();
+        let host = url.host_str().unwrap_or_default();
+        if host.is_empty() {
+            return attempt.stop();
+        }
+        // Synchronous resolve here is fine: redirects are rare, and this
+        // path is only hit when following one.
+        let blocked = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => is_blocked_backup_restore_ip(host, ip, &allowlist),
+            Err(_) => {
+                use std::net::ToSocketAddrs;
+                match (host, url.port_or_known_default().unwrap_or(80)).to_socket_addrs() {
+                    Ok(addrs) => addrs
+                        .map(|a| a.ip())
+                        .any(|ip| is_blocked_backup_restore_ip(host, ip, &allowlist)),
+                    Err(_) => true,
+                }
+            }
+        };
+        if blocked {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    });
     reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(policy)
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot build http client: {e}")))
@@ -710,8 +787,26 @@ async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, trun
         "(restoring): backup selected; stopping server...".to_string(),
     ));
 
+    // wings: restore aborts when the server cannot be stopped.
     if server.is_running() {
-        let _ = server.power_stop(30).await;
+        if let Err(e) = server.power_stop(30).await {
+            tracing::error!(uuid = %backup_uuid, error = %e, "restore aborted: server did not stop");
+            server.publish(ServerEvent::DaemonMessage(format!("(restoring): failed: {e}")));
+            server.publish(ServerEvent::BackupRestoreCompleted(
+                serde_json::json!({
+                    "uuid": backup_uuid,
+                    "successful": false,
+                })
+                .to_string(),
+            ));
+            let _ = server
+                .panel
+                .read()
+                .await
+                .post_backup_restore_status(backup_uuid, false)
+                .await;
+            return;
+        }
     }
     server.set_restoring(true);
 

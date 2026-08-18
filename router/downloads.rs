@@ -251,7 +251,17 @@ async fn incoming_transfer(
         .and_then(|s| Uuid::parse_str(&s).ok())
         .ok_or_else(|| AppError::Unauthorized("token has no valid server subject".into()))?;
 
+    // Mirror wings installer.New: a transfer creates a fresh server
+    // instance. Roost keeps one instance per server, so a server that is
+    // already registered (and especially one that is running) must not
+    // have its live data clobbered by an incoming transfer.
+    let existed = state.manager.get(uuid).await.is_ok();
     let server = state.manager.register(uuid).await?;
+    if server.is_running() {
+        return Err(AppError::Conflict(
+            "A running server cannot receive a transfer".into(),
+        ));
+    }
     if server.is_transferring() {
         return Err(AppError::Conflict("A transfer is already in progress for this server.".into()));
     }
@@ -264,9 +274,10 @@ async fn incoming_transfer(
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create tmp dir: {e}")))?;
     let archive_path = tmp_dir.join(format!("{uuid}.transfer.tar.gz"));
+    let disk_limit = server.config.read().await.build.disk_space.max(0) as u64 * 1024 * 1024;
 
     let result = tokio::select! {
-        r = receive_transfer_archive(&mut multipart, &archive_path, &data_dir) => r,
+        r = receive_transfer_archive(&mut multipart, &archive_path, &data_dir, disk_limit) => r,
         _ = cancel.cancelled() => {
             Err(AppError::Internal(anyhow::anyhow!("incoming transfer cancelled")))
         }
@@ -274,6 +285,19 @@ async fn incoming_transfer(
 
     let successful = result.is_ok();
     if successful {
+        // Wings enforces the disk limit while extracting; verify the
+        // extracted tree fits and roll back if it does not.
+        if disk_limit > 0 && server.fs.disk_usage() > disk_limit {
+            let _ = std::fs::remove_dir_all(&data_dir);
+            tracing::warn!(uuid = %uuid, "incoming transfer exceeds disk limit, rolled back");
+            server.publish(ServerEvent::TransferStatus("failure".into()));
+            server.set_transferring(false);
+            server.clear_incoming_cancel().await;
+            let _ = std::fs::remove_file(&archive_path);
+            return Err(AppError::BadRequest(
+                "transfer would exceed the server disk limit".into(),
+            ));
+        }
         server.publish(ServerEvent::TransferStatus("success".into()));
         tracing::info!(uuid = %uuid, "incoming transfer completed");
     } else {
@@ -284,18 +308,26 @@ async fn incoming_transfer(
 
     server.set_transferring(false);
     server.clear_incoming_cancel().await;
-    let _ = state
+    let post = state
         .panel
         .read()
         .await
         .post_transfer_status(uuid, successful)
         .await;
+    let post_ok = post.is_ok();
+    if let Err(e) = post {
+        tracing::warn!(uuid = %uuid, error = %e, "failed to set transfer status on panel");
+    }
 
-    if !successful {
-        // Mirror wings: drop the server from the manager and delete the
-        // extracted files so a retry starts from a clean slate.
+    if !successful && !existed {
+        // Mirror wings: a failed transfer drops the fresh server instance
+        // from the manager, and the extracted files are deleted only when
+        // the panel status POST also failed (otherwise the panel may still
+        // hold a valid server that we would wipe).
         let _ = state.manager.remove(uuid).await;
-        let _ = std::fs::remove_dir_all(&data_dir);
+        if !post_ok {
+            let _ = std::fs::remove_dir_all(&data_dir);
+        }
     }
     let _ = std::fs::remove_file(&archive_path);
 
@@ -309,6 +341,7 @@ async fn receive_transfer_archive(
     multipart: &mut Multipart,
     archive_path: &std::path::Path,
     data_dir: &std::path::Path,
+    disk_limit: u64,
 ) -> AppResult<()> {
     use sha2::{Digest, Sha256};
 
@@ -317,6 +350,7 @@ async fn receive_transfer_archive(
     let mut hasher = Sha256::new();
     let mut got_archive = false;
     let mut checksum: Option<String> = None;
+    let mut received: u64 = 0;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
         AppError::BadRequest(format!("transfer multipart error: {e}"))
@@ -327,6 +361,14 @@ async fn receive_transfer_archive(
                 while let Some(chunk) = field.chunk().await.map_err(|e| {
                     AppError::BadRequest(format!("transfer archive interrupted: {e}"))
                 })? {
+                    received += chunk.len() as u64;
+                    // The transfer must never exceed the server disk limit
+                    // (wings aborts when the stream exceeds available space).
+                    if disk_limit > 0 && received > disk_limit {
+                        return Err(AppError::BadRequest(
+                            "transfer archive exceeds the server disk limit".into(),
+                        ));
+                    }
                     hasher.update(&chunk);
                     std::io::Write::write_all(&mut file, &chunk).map_err(|e| {
                         AppError::Internal(anyhow::anyhow!("cannot write archive: {e}"))
