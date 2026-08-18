@@ -91,6 +91,73 @@ impl Filesystem {
         Ok(joined)
     }
 
+    /// Resolve a file name relative to an already-resolved base directory,
+    /// rejecting any `..` component (wings filepath.Join + safePath).
+    fn resolve_under(&self, base: &Path, rel: &str) -> AppResult<PathBuf> {
+        let joined = base.join(rel);
+        let components: Vec<Component> = joined.components().collect();
+        if components.iter().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(AppError::BadRequest("path escapes the server directory".into()));
+        }
+        Ok(joined)
+    }
+
+    /// Confine an operation to the server root: the nearest existing
+    /// ancestor of `p` must canonicalize inside the (canonical) root, so
+    /// symlinked parent directories can never reach outside the data
+    /// directory (wings safePath + O_NOFOLLOW confinement).
+    pub(crate) fn assert_contained(&self, p: &Path) -> AppResult<()> {
+        let canon_root = self.root.canonicalize().map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("cannot canonicalize data dir: {e}"))
+        })?;
+        let mut ancestor = p.to_path_buf();
+        loop {
+            match ancestor.canonicalize() {
+                Ok(canon) => {
+                    if !canon.starts_with(&canon_root) {
+                        return Err(AppError::BadRequest(
+                            "path escapes the server directory".into(),
+                        ));
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if !ancestor.pop() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a path inside the root with O_NOFOLLOW, so the final component
+    /// can never resolve through a symlink (wings openat with NOFOLLOW).
+    fn open_no_follow(&self, p: &Path, flags: nix::fcntl::OFlag, mode: nix::sys::stat::Mode) -> AppResult<std::fs::File> {
+        use nix::fcntl::OFlag;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.custom_flags((flags | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits());
+        if flags.contains(OFlag::O_RDONLY) {
+            opts.read(true);
+        }
+        if flags.contains(OFlag::O_WRONLY) {
+            opts.write(true);
+        }
+        if flags.contains(OFlag::O_CREAT) {
+            opts.create(true);
+        }
+        if flags.contains(OFlag::O_TRUNC) {
+            opts.truncate(true);
+        }
+        if flags.contains(OFlag::O_EXCL) {
+            opts.create_new(true);
+        }
+        opts.mode(mode.bits());
+        opts.open(p)
+            .map_err(|e| AppError::BadRequest(format!("cannot open {}: {e}", p.display())))
+    }
+
     fn is_denied(&self, path: &str) -> bool {
         let normalized = Path::new(path)
             .components()
@@ -102,9 +169,20 @@ impl Filesystem {
             .join("/");
 
         let denylist = self.denylist.read().map(|g| g.clone()).unwrap_or_default();
-        denylist
-            .iter()
-            .any(|entry| entry == &normalized || path.contains(entry))
+        denylist.iter().any(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return false;
+            }
+            // Wings matches the denylist with gitignore semantics: a
+            // pattern without a slash matches any path component, a
+            // pattern with a slash matches relative to the server root.
+            if entry.contains('/') {
+                glob_match(entry, &normalized)
+            } else {
+                normalized.split('/').any(|comp| glob_match(entry, comp))
+            }
+        })
     }
 
     pub fn check_denied(&self, path: &str) -> AppResult<()> {
@@ -157,33 +235,52 @@ pub fn rel(&self, abs: &Path) -> String {
     pub fn read(&self, path: &str) -> AppResult<Vec<u8>> {
         let p = self.resolve(path)?;
         self.check_denied(path)?;
+        self.assert_contained(&p)?;
         // Wings refuses to read named pipes (FIFOs) — they can block or
-        // dump unbounded data.
-        let meta = fs::symlink_metadata(&p)
+        // dump unbounded data. O_NONBLOCK guarantees the open itself never
+        // blocks; the fstat below rejects anything that is not a regular
+        // file (O_NOFOLLOW already refused symlinks at open time).
+        use nix::fcntl::OFlag;
+        let mut file = self.open_no_follow(&p, OFlag::O_RDONLY | OFlag::O_NONBLOCK, nix::sys::stat::Mode::empty())?;
+        let meta = file
+            .metadata()
             .map_err(|e| AppError::BadRequest(format!("cannot stat {path}: {e}")))?;
         if !meta.is_file() {
             return Err(AppError::BadRequest(format!(
                 "refusing to read {path}: not a regular file"
             )));
         }
-        fs::read(&p).map_err(|e| AppError::BadRequest(format!("cannot read {path}: {e}")))
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buf)
+            .map_err(|e| AppError::BadRequest(format!("cannot read {path}: {e}")))?;
+        Ok(buf)
     }
 
     pub fn write(&self, path: &str, bytes: &[u8]) -> AppResult<()> {
         let p = self.resolve(path)?;
         self.check_denied(path)?;
+        self.assert_contained(&p)?;
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| AppError::BadRequest(format!("cannot create parent dir: {e}")))?;
         }
         // Wings Write: the amount of new data must fit before writing.
-        let current = fs::metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
+        let current = fs::symlink_metadata(&p).map(|m| m.len() as i64).unwrap_or(0);
         if !self.has_space_for(bytes.len() as i64 - current) {
             return Err(AppError::BadRequest(
                 "filesystem: not enough disk space".into(),
             ));
         }
-        fs::write(&p, bytes).map_err(|e| AppError::BadRequest(format!("cannot write {path}: {e}")))?;
+        // O_NOFOLLOW: the final component must not be a symlink (an open
+        // through a symlink would write outside the server directory).
+        use nix::fcntl::OFlag;
+        let mut file = self.open_no_follow(
+            &p,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )?;
+        std::io::Write::write_all(&mut file, bytes)
+            .map_err(|e| AppError::BadRequest(format!("cannot write {path}: {e}")))?;
         self.chown(&p);
         Ok(())
     }
@@ -207,6 +304,7 @@ pub fn rel(&self, abs: &Path) -> String {
 
     pub fn create_directory(&self, name: &str, path: &str) -> AppResult<()> {
         let p = self.resolve(path)?.join(name);
+        self.assert_contained(&p)?;
         fs::create_dir_all(&p)
             .map_err(|e| AppError::BadRequest(format!("cannot create directory {name}: {e}")))
     }
@@ -216,8 +314,10 @@ pub fn rel(&self, abs: &Path) -> String {
         for (to, from) in files {
             self.check_denied(from)?;
             self.check_denied(to)?;
-            let src = base.join(from);
-            let dst = base.join(to);
+            let src = self.resolve_under(&base, from)?;
+            let dst = self.resolve_under(&base, to)?;
+            self.assert_contained(&src)?;
+            self.assert_contained(&dst)?;
             if dst.parent().map(|p| p.as_os_str()) != src.parent().map(|p| p.as_os_str()) {
                 return Err(AppError::BadRequest("rename source and target must be in the same directory".into()));
             }
@@ -232,21 +332,34 @@ pub fn rel(&self, abs: &Path) -> String {
     }
 
     pub fn copy(&self, location: &str) -> AppResult<FileStat> {
+        use nix::fcntl::OFlag;
         let src = self.resolve(location)?;
         self.check_denied(location)?;
-        if !src.is_file() {
-            return Err(AppError::BadRequest("only files can be copied".into()));
-        }
+        self.assert_contained(&src)?;
+        let mut src_file =
+            self.open_no_follow(&src, OFlag::O_RDONLY, nix::sys::stat::Mode::empty())?;
         let parent = src.parent().unwrap_or(&self.root);
         let name = src.file_name().unwrap_or_default().to_string_lossy();
         let mut dest = parent.join(format!("copy of {name}"));
         let mut i = 0;
-        while dest.exists() {
-            i += 1;
-            dest = parent.join(format!("copy of {name} ({i})"));
+        loop {
+            match self.open_no_follow(
+                &dest,
+                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                nix::sys::stat::Mode::from_bits_truncate(0o644),
+            ) {
+                Ok(mut out) => {
+                    std::io::copy(&mut src_file, &mut out)
+                        .map_err(|e| AppError::BadRequest(format!("cannot copy {location}: {e}")))?;
+                    break;
+                }
+                Err(_) if dest.exists() => {
+                    i += 1;
+                    dest = parent.join(format!("copy of {name} ({i})"));
+                }
+                Err(e) => return Err(e),
+            }
         }
-        fs::copy(&src, &dest)
-            .map_err(|e| AppError::BadRequest(format!("cannot copy {location}: {e}")))?;
         self.stat(&dest)
     }
 
@@ -254,7 +367,8 @@ pub fn rel(&self, abs: &Path) -> String {
         let base = self.resolve(root)?;
         for file in files {
             self.check_denied(file)?;
-            let p = base.join(file);
+            let p = self.resolve_under(&base, file)?;
+            self.assert_contained(&p)?;
             let meta = match fs::symlink_metadata(&p) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -275,7 +389,8 @@ pub fn rel(&self, abs: &Path) -> String {
         let base = self.resolve(root)?;
         for (file, mode) in files {
             self.check_denied(file)?;
-            let p = base.join(file);
+            let p = self.resolve_under(&base, file)?;
+            self.assert_contained(&p)?;
             let meta = fs::symlink_metadata(&p)
                 .map_err(|e| AppError::BadRequest(format!("cannot stat {file}: {e}")))?;
             if meta.is_symlink() {
@@ -289,30 +404,23 @@ pub fn rel(&self, abs: &Path) -> String {
 
     /// Compress the given files into `<random>.tar.gz` in `root`.
     pub fn compress(&self, root: &str, files: &[String]) -> AppResult<FileStat> {
-        uuids::archive(&self.root, root, files)
-            .map_err(|e| AppError::BadRequest(format!("cannot compress: {e}")))?;
-        // find the created archive
         let base = self.resolve(root)?;
-        let mut newest: Option<PathBuf> = None;
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("tar.gz") {
-                    newest = Some(p);
-                }
-            }
+        for f in files {
+            let p = self.resolve_under(&base, f)?;
+            self.assert_contained(&p)?;
         }
-        let arch = newest.ok_or_else(|| AppError::BadRequest("archive was not created".into()))?;
+        let dest = uuids::archive(&self.root, root, files)
+            .map_err(|e| AppError::BadRequest(format!("cannot compress: {e}")))?;
         // Wings: if the archive does not fit under the limit, remove it and
         // report a disk space error.
-        let size = fs::metadata(&arch).map(|m| m.len() as i64).unwrap_or(0);
+        let size = fs::metadata(&dest).map(|m| m.len() as i64).unwrap_or(0);
         if !self.has_space_for(size) {
-            let _ = fs::remove_file(&arch);
+            let _ = fs::remove_file(&dest);
             return Err(AppError::BadRequest(
                 "filesystem: not enough disk space".into(),
             ));
         }
-        self.stat(&arch)
+        self.stat(&dest)
     }
 
     /// Decompress a `.zip`, `.tar.gz`, `.tar` (or plain `.gz`) archive in
@@ -320,7 +428,8 @@ pub fn rel(&self, abs: &Path) -> String {
     pub fn decompress(&self, root: &str, file: &str) -> AppResult<()> {
         let base = self.resolve(root)?;
         self.check_denied(file)?;
-        let archive = base.join(file);
+        let archive = self.resolve_under(&base, file)?;
+        self.assert_contained(&archive)?;
         let lower = file.to_lowercase();
         if !(lower.ends_with(".zip")
             || lower.ends_with(".tar.gz")
@@ -352,13 +461,31 @@ pub fn rel(&self, abs: &Path) -> String {
             .map_err(|e| AppError::BadRequest(format!("cannot extract {}: {e}", archive.display())))
     }
 
-    /// Used disk space of the filesystem that holds the server data.
-    /// Mirrors wings `DiskUsage` (statfs-based).
+    /// Used disk space of the server data directory, computed with `du`
+    /// semantics: a non-recursive walk that does not follow symlinks
+    /// (wings `DirectorySize` — filepath.Walk uses Lstat, so symlinks are
+    /// counted by their own size, never traversed).
     pub fn disk_usage(&self) -> u64 {
-        match statvfs(&self.root) {
-            Ok(s) => (s.blocks() - s.blocks_available()) * s.block_size(),
-            Err(_) => 0,
+        let mut total: u64 = 0;
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let meta = match fs::symlink_metadata(entry.path()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
         }
+        total
     }
 
     /// Total available space on the data filesystem (used for disk limit).
@@ -544,36 +671,31 @@ mod uuids {
         Ok(dest)
     }
 
+    /// Extract a tar.gz archive into `base`, wing-style: entry paths are
+    /// used as-is (never stripped — wings uses mholt/archives which does
+    /// not unwrap a top-level folder) and path traversal is blocked.
     pub fn extract(archive: &Path, base: &Path) -> std::io::Result<()> {
         let file = std::fs::File::open(archive)?;
         let gz = flate2::read::GzDecoder::new(file);
         let mut tar = tar::Archive::new(gz);
         tar.set_unpack_xattrs(false);
         tar.set_preserve_permissions(false);
-        // The archive entries may start with a top-level folder; extract
-        // into base unwrapped (strip the first component).
         tar.entries()?
             .filter_map(|e| e.ok())
             .try_for_each(|mut entry| -> std::io::Result<()> {
                 let entry_path = entry.path()?.into_owned();
-                let mut parts = entry_path.components().peekable();
-                // skip the root component if present
-                if parts.peek().is_some() {
-                    parts.next();
-                }
-                let rel: std::path::PathBuf = parts.collect();
-                if rel.as_os_str().is_empty() {
+                if entry_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                     return Ok(());
                 }
-                let dest = base.join(&rel);
+                let dest = base.join(&entry_path);
+                // Guard against path traversal inside the archive.
+                if !dest.starts_with(base) {
+                    return Ok(());
+                }
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Guard against path traversal inside the archive.
-                if dest.starts_with(base) {
-                    entry.unpack(&dest)?;
-                }
-                Ok(())
+                entry.unpack(&dest).map(|_| ())
             })
     }
 
@@ -709,6 +831,35 @@ mod uuids {
                 entry.unpack(&dest).map(|_| ())
             })
     }
+}
+
+/// Minimal glob matcher supporting `*`, `**` and `?`, used for the file
+/// denylist (wings matches it with gitignore semantics via
+/// ignore.CompileIgnoreLines + MatchesPath).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn m(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') if p.get(1) == Some(&'*') => {
+                let rest = &p[2..];
+                (0..=t.len()).any(|i| m(rest, &t[i..]))
+            }
+            Some('*') => {
+                let rest = &p[1..];
+                (0..=t.len()).any(|i| {
+                    if t.get(i) == Some(&'/') {
+                        return false;
+                    }
+                    m(rest, &t[i..])
+                })
+            }
+            Some('?') => !t.is_empty() && m(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && m(&p[1..], &t[1..]),
+        }
+    }
+    m(&p, &t)
 }
 
 /// Minimal hex encoding (avoids an extra dependency for sha1 output).

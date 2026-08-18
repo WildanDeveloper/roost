@@ -218,13 +218,16 @@ async fn chmod(
         .files
         .into_iter()
         .map(|f| {
-            let mode = u32::from_str_radix(f.mode.trim_start_matches('0'), 8)
-                .map_err(|_| AppError::BadRequest(format!("invalid mode: {}", f.mode)))
-                .ok()
-                .unwrap_or(0);
-            (f.file, mode)
+            let trimmed = if f.mode.len() > 1 {
+                f.mode.trim_start_matches('0')
+            } else {
+                &f.mode
+            };
+            let mode = u32::from_str_radix(trimmed, 8)
+                .map_err(|_| AppError::BadRequest(format!("invalid mode: {}", f.mode)))?;
+            Ok((f.file, mode))
         })
-        .collect();
+        .collect::<AppResult<Vec<_>>>()?;
     server.fs.chmod(&payload.root, &pairs)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -311,6 +314,7 @@ async fn post_pull(
 
     // Download into a temp file, then move into place (atomic-ish).
     let dest = server.fs.resolve(&directory)?.join(&file_name);
+    server.fs.assert_contained(&dest)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AppError::BadRequest(format!("cannot create directory: {e}")))?;
@@ -375,6 +379,11 @@ async fn run_download(
     let cancel = dl.child_token();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        // Never follow redirects: an attacker-controlled server could
+        // redirect the download to a private/local address, bypassing the
+        // SSRF guard in validate_download_url (wings rejects redirects
+        // to private ranges on each hop; we reject all redirects).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
     let mut resp = client
@@ -387,9 +396,21 @@ async fn run_download(
     }
     let total = resp.content_length().unwrap_or(0);
 
-    let mut out = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("cannot create {file_name}: {e}")))?;
+    let mut out = {
+        use nix::fcntl::OFlag;
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: never write through a planted symlink.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits());
+        tokio::fs::File::from_std(
+            opts.open(dest)
+                .map_err(|e| AppError::BadRequest(format!("cannot create {file_name}: {e}")))?,
+        )
+    };
     let mut written: u64 = 0;
     while let Some(chunk) = resp.chunk().await.map_err(|e| AppError::BadRequest(format!("download interrupted: {e}")))? {
         if cancel.is_cancelled() {
@@ -451,7 +472,16 @@ fn blocklisted(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 198 && (18..=19).contains(&v4.octets()[1])) // 198.18/15
                 || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
         }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            // ::ffff:a.b.c.d is an IPv4-mapped address — evaluate as IPv4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return blocklisted(&IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
     }
 }
 

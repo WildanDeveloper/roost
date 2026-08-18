@@ -270,9 +270,13 @@ pub async fn disk_bytes(&self) -> u64 {
             let daemon = self.daemon.try_read().map(|c| c.clone()).unwrap_or_default();
             daemon.system.disk_check_interval
         };
+        // A disk check interval of 0 disables the check entirely (wings
+        // DiskUsage returns 0 in that case, so the limit never triggers).
+        if interval == 0 {
+            return 0;
+        }
         let mut cache = self.disk_cache.lock().await;
-        let refresh = interval == 0 || cache.1.elapsed().as_secs() >= interval;
-        if refresh {
+        if cache.1.elapsed().as_secs() >= interval {
             cache.0 = self.fs.disk_usage();
             cache.1 = Instant::now();
         }
