@@ -456,7 +456,20 @@ impl SftpFs {
             crate::models::Activity::new(&self.authed.server, event)
                 .with_user(Some(self.authed.user.clone()))
                 .with_ip(String::new())
-                .with_metadata(serde_json::json!({ "path": path })),
+                .with_metadata(serde_json::json!({ "files": [path] })),
+        );
+    }
+
+    /// Wings metadata shape for rename/move events:
+    /// `{"files": [{"from": "/old", "to": "/new"}]}`.
+    fn log_rename_activity(&self, event: &str, from: &str, to: &str) {
+        self.srv.activity.push(
+            crate::models::Activity::new(&self.authed.server, event)
+                .with_user(Some(self.authed.user.clone()))
+                .with_ip(String::new())
+                .with_metadata(serde_json::json!({
+                    "files": [{"from": from, "to": to}]
+                })),
         );
     }
 }
@@ -757,6 +770,7 @@ impl SftpFsHandler for SftpFs {
                 return Err(sr(StatusCode::PermissionDenied, "missing file.create"));
             }
             std::fs::create_dir(self.resolve(&path)?).map_err(io_err)?;
+            self.log_activity("server:sftp.create-directory", &path);
             Ok(status_ok(_id))
         })();
         async move { result }
@@ -835,6 +849,7 @@ impl SftpFsHandler for SftpFs {
                 std::fs::create_dir_all(parent).ok();
             }
             std::fs::rename(&src, &dst).map_err(io_err)?;
+            self.log_rename_activity("server:sftp.rename", &oldpath, &newpath);
             Ok(status_ok(_id))
         })();
         async move { result }

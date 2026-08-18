@@ -300,42 +300,73 @@ async fn handle_inbound(
         "set state" => {
             let action = inbound.args.first().map(|s| s.as_str()).unwrap_or("");
             let user = claims.user_uuid.clone();
+            let activity = state.activity.clone();
+            // Wings logs power activity only after the action completes
+            // successfully (HandlePowerAction returns no error).
             match action {
                 "start" if claims.has_permission("control.start") => {
-                    state.activity.push(
-                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.start")
-                            .with_user(user)
-                            .with_ip(client_ip.to_string()),
-                    );
                     let srv = server.clone();
-                    tokio::spawn(async move { let _ = srv.power_start().await; });
+                    let ip = client_ip.to_string();
+                    tokio::spawn(async move {
+                        if srv.power_start().await.is_ok() {
+                            activity.push(
+                                crate::models::Activity::new(
+                                    &srv.uuid.to_string(),
+                                    "server:power.start",
+                                )
+                                .with_user(user)
+                                .with_ip(ip),
+                            );
+                        }
+                    });
                 }
                 "stop" if claims.has_permission("control.stop") => {
-                    state.activity.push(
-                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.stop")
-                            .with_user(user)
-                            .with_ip(client_ip.to_string()),
-                    );
                     let srv = server.clone();
-                    tokio::spawn(async move { let _ = srv.power_stop(30).await; });
+                    let ip = client_ip.to_string();
+                    tokio::spawn(async move {
+                        if srv.power_stop(30).await.is_ok() {
+                            activity.push(
+                                crate::models::Activity::new(
+                                    &srv.uuid.to_string(),
+                                    "server:power.stop",
+                                )
+                                .with_user(user)
+                                .with_ip(ip),
+                            );
+                        }
+                    });
                 }
                 "restart" if claims.has_permission("control.restart") => {
-                    state.activity.push(
-                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.restart")
-                            .with_user(user)
-                            .with_ip(client_ip.to_string()),
-                    );
                     let srv = server.clone();
-                    tokio::spawn(async move { let _ = srv.power_restart(30).await; });
+                    let ip = client_ip.to_string();
+                    tokio::spawn(async move {
+                        if srv.power_restart(30).await.is_ok() {
+                            activity.push(
+                                crate::models::Activity::new(
+                                    &srv.uuid.to_string(),
+                                    "server:power.restart",
+                                )
+                                .with_user(user)
+                                .with_ip(ip),
+                            );
+                        }
+                    });
                 }
                 "kill" if claims.has_permission("control.stop") => {
-                    state.activity.push(
-                        crate::models::Activity::new(&server.uuid.to_string(), "server:power.kill")
-                            .with_user(user)
-                            .with_ip(client_ip.to_string()),
-                    );
                     let srv = server.clone();
-                    tokio::spawn(async move { let _ = srv.power_kill().await; });
+                    let ip = client_ip.to_string();
+                    tokio::spawn(async move {
+                        if srv.power_kill().await.is_ok() {
+                            activity.push(
+                                crate::models::Activity::new(
+                                    &srv.uuid.to_string(),
+                                    "server:power.kill",
+                                )
+                                .with_user(user)
+                                .with_ip(ip),
+                            );
+                        }
+                    });
                 }
                 other => {
                     tracing::warn!(action = ?other, "invalid or unauthorized set state");

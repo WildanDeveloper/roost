@@ -85,11 +85,36 @@ impl ServerBuild {
             oom_kill_disable: Some(limit.oom_disabled),
             // Wings removes the PID limit for installer containers.
             pids_limit: if installer { None } else { Some(docker.container_pid_limit) },
-            blkio_weight: Some(limit.io_weight.clamp(10, 1000) as u16),
+            // Wings probes the cgroup hierarchy: on cgroup v2 the io.weight
+            // knob must exist on the delegated cgroups or runc fails to
+            // create the container; cgroup v1/hybrid always supports it.
+            blkio_weight: if blkio_weight_supported() {
+                Some(limit.io_weight.clamp(10, 1000) as u16)
+            } else {
+                None
+            },
             cpu_quota,
             cpu_period,
             cpu_shares: if docker.cpu_shares > 0 { Some(docker.cpu_shares as i64) } else { None },
             cpuset_cpus: if limit.threads.is_empty() { None } else { Some(limit.threads.clone()) },
         }
     }
+}
+
+/// Mirrors wings `blkioWeightSupported`: cgroup v1/hybrid always honors the
+/// weight via blkio.weight; on v2 the io.weight knob must be present on the
+/// delegated child cgroups (not the root).
+fn blkio_weight_supported() -> bool {
+    if !std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return true;
+    }
+    for p in [
+        "/sys/fs/cgroup/system.slice/io.weight",
+        "/sys/fs/cgroup/io.weight",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return true;
+        }
+    }
+    false
 }
