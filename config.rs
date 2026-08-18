@@ -433,21 +433,28 @@ impl Config {
     }
 
     /// Create all directories the daemon needs and verify Docker access.
+    /// Directories are created with 0700 permissions like wings
+    /// (os.MkdirAll with 0o700).
     pub fn ensure_directories(&self) -> AppResult<()> {
+        use std::os::unix::fs::DirBuilderExt;
         for dir in [
             self.tmp_dir(),
             self.log_dir(),
             self.archive_dir(),
             self.backup_dir(),
         ] {
-            std::fs::create_dir_all(&dir).map_err(|e| {
-                AppError::Config(format!("cannot create {}: {e}", dir.display()))
-            })?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| AppError::Config(format!("cannot create {}: {e}", dir.display())))?;
         }
         if !self.system.data.is_empty() {
-            std::fs::create_dir_all(&self.system.data).map_err(|e| {
-                AppError::Config(format!("cannot create {}: {e}", self.system.data))
-            })?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.system.data)
+                .map_err(|e| AppError::Config(format!("cannot create {}: {e}", self.system.data)))?;
         }
         // Wings ConfigurePasswd: generate /etc/{group,passwd} overrides for
         // containers when the feature is enabled.

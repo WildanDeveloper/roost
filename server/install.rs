@@ -10,6 +10,26 @@ use crate::server::events::ServerEvent;
 
 use super::Server;
 
+/// Removes the installer container and staging directory when the install
+/// function exits, even on failure (wings cleans up on abort).
+struct InstallerCleanup {
+    docker: crate::docker::DockerClient,
+    name: String,
+    tmp_dir: std::path::PathBuf,
+}
+
+impl Drop for InstallerCleanup {
+    fn drop(&mut self) {
+        let docker = self.docker.clone();
+        let name = self.name.clone();
+        let tmp_dir = self.tmp_dir.clone();
+        tokio::spawn(async move {
+            let _ = docker.remove(&name).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        });
+    }
+}
+
 impl Server {
     /// Run the egg install script for this server. Stops the server first,
     /// runs the `<uuid>_installer` container, then reports the outcome to
@@ -21,9 +41,20 @@ impl Server {
             return;
         }
 
-        // Make sure the server isn't running while installing.
+        // Make sure the server isn't running while installing. Wings
+        // aborts the install when the server cannot be stopped
+        // (WaitForStop, 2 minutes); installing over a live process would
+        // corrupt the data directory.
         if self.is_running() {
-            let _ = self.power_stop(30).await;
+            if let Err(e) = self.power_stop(30).await {
+                self.publish(ServerEvent::DaemonMessage(format!(
+                    "Installation failed; server could not be stopped: {e}"
+                )));
+                self.publish(ServerEvent::InstallCompleted);
+                self.installing.store(false, Ordering::SeqCst);
+                self.set_state(crate::server::ServerState::Offline).await;
+                return;
+            }
         }
         // Abort any active SFTP sessions; the data directory is about to
         // change underneath them (mirrors wings `Sftp().CancelAll()`).
@@ -112,10 +143,17 @@ impl Server {
             tracing::warn!(uuid = %self.uuid, image = %script.container_image, error = %e, "could not pull installer image");
         }
 
-        // 4. Recreate the installer container.
+        // 4. Recreate the installer container. The cleanup guard makes
+        // sure the container and temp files are removed even when a later
+        // step fails (wings removes the installer container on abort).
         let installer_name = format!("{}_installer", self.uuid);
         tracing::info!(uuid = %self.uuid, "creating installer container");
         self.docker.remove(&installer_name).await?;
+        let _cleanup = InstallerCleanup {
+            docker: self.docker.clone(),
+            name: installer_name.clone(),
+            tmp_dir: tmp_dir.clone(),
+        };
 
         let env = self.build_env().await;
         let network_ip = daemon.docker.network.interface.clone();

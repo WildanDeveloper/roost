@@ -9,19 +9,30 @@ use tokio::sync::RwLock;
 
 /// In-memory buffer for activity events that are flushed to the panel on an
 /// interval. Mirrors wings' SQLite-backed activity store + activity cron.
+/// The buffer is capped: if the panel is unreachable for a long time the
+/// oldest events are dropped instead of growing without bound.
 pub struct ActivityCollector {
     buffer: Mutex<VecDeque<Activity>>,
+    /// Soft cap: when the buffer exceeds this, the oldest entries are
+    /// dropped (wings keeps the last 30 days in SQLite; an unbounded
+    /// in-memory queue is the equivalent memory exhaustion vector).
+    max_buffer: usize,
 }
 
 impl ActivityCollector {
     pub fn new() -> Self {
         Self {
             buffer: Mutex::new(VecDeque::new()),
+            max_buffer: 10_000,
         }
     }
 
     pub fn push(&self, activity: Activity) {
-        self.buffer.lock().unwrap().push_back(activity);
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() >= self.max_buffer {
+            buf.pop_front();
+        }
+        buf.push_back(activity);
     }
 
     /// Take up to `limit` entries from the front of the queue.

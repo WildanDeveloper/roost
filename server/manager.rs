@@ -161,9 +161,13 @@ impl ServerManager {
         Ok(())
     }
 
-    /// Remove a server: stop it, destroy its container, remove data.
+    /// Remove a server: stop it, destroy its container, remove data. All
+    /// live websocket and SFTP sessions are aborted first (wings
+    /// Server.Delete calls Websockets().CancelAll() and Sftp().CancelAll()).
     pub async fn delete(&self, uuid: Uuid) -> AppResult<()> {
         let server = self.get(uuid).await?;
+        server.cancel_websockets().await;
+        crate::sftp::cancel_sessions_for(&uuid.to_string()).await;
         server.delete_container(true).await?;
         self.servers.write().await.remove(&uuid);
         tracing::info!(uuid = %uuid, "server deleted");

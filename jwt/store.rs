@@ -35,11 +35,15 @@ impl TokenStore {
     }
 
     pub async fn deny_jti(&self, jti: &str, at: i64) {
-        self.denied_jti.write().unwrap().insert(format!("jti:{jti}"), at);
+        let mut m = self.denied_jti.write().unwrap();
+        m.retain(|_, floor| *floor >= revocation_floor(self.ttl));
+        m.insert(format!("jti:{jti}"), at);
     }
 
     pub async fn deny_user(&self, user: &str, at: i64) {
-        self.denied_user.write().unwrap().insert(user.to_string(), at);
+        let mut m = self.denied_user.write().unwrap();
+        m.retain(|_, floor| *floor >= revocation_floor(self.ttl));
+        m.insert(user.to_string(), at);
     }
 
     #[allow(dead_code)]
@@ -61,4 +65,16 @@ pub fn is_user_denied(&self, user: &str, iat: i64) -> bool {
             .map(|at| iat < *at)
             .unwrap_or(false)
     }
+}
+
+/// Denial entries older than this are dropped on insert: a revocation
+/// floor `at` only matters for tokens issued after it, and any token with
+/// iat older than one TTL is already expired, so the floor is no longer
+/// load-bearing (keeps the maps bounded).
+fn revocation_floor(ttl: Duration) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now.saturating_sub(ttl.as_secs() as i64)
 }

@@ -340,6 +340,15 @@ async fn push_archive_to_target(
     let root = server.fs.root().to_path_buf();
     let daemon = server.daemon.read().await.clone();
     let archive_path = daemon.tmp_dir().join(format!("{}.outgoing.tar.gz", server.uuid));
+    // The archive must be removed on every exit path (wings deletes it in
+    // a defer); a stale archive would otherwise linger and be resent.
+    struct ArchiveGuard(std::path::PathBuf);
+    impl Drop for ArchiveGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = ArchiveGuard(archive_path.clone());
 
     std::fs::create_dir_all(daemon.tmp_dir())
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create tmp dir: {e}")))?;
@@ -430,7 +439,6 @@ async fn push_archive_to_target(
         )));
     }
 
-    let _ = std::fs::remove_file(&archive_path);
     Ok(())
 }
 

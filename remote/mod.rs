@@ -282,7 +282,13 @@ pub async fn post_archive_status(&self, uuid: Uuid, successful: bool) -> AppResu
                     }
                     if status.is_client_error() {
                         let text = resp.text().await.unwrap_or_default();
-                        return Err(AppError::Remote(format!("panel {status}: {text}")));
+                        // Truncate error bodies so an abusive panel
+                        // response cannot flood the logs (wings caps the
+                        // response text it reports).
+                        return Err(AppError::Remote(format!(
+                            "panel {status}: {}",
+                            &text[..text.len().min(4000)]
+                        )));
                     }
                     // server error -> retry
                 }

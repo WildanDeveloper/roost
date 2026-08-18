@@ -340,8 +340,9 @@ async fn post_pull(
     let url_clone = payload.url.clone();
     let file_name_clone = file_name.clone();
     let dest_clone = dest.clone();
+    let disk_limit = server.config.read().await.build.disk_space.max(0) as u64 * 1024 * 1024;
     let run = async move {
-        let result = run_download(&dest_clone, &url_clone, &file_name_clone, &dl_clone)
+        let result = run_download(&dest_clone, &url_clone, &file_name_clone, &dl_clone, disk_limit)
             .await;
         let _ = super::downloader::untrack(&dl_clone.identifier);
         result
@@ -374,6 +375,7 @@ async fn run_download(
     url: &str,
     file_name: &str,
     dl: &Arc<super::downloader::Download>,
+    disk_limit: u64,
 ) -> AppResult<()> {
     use tokio::io::AsyncWriteExt;
     let cancel = dl.child_token();
@@ -419,14 +421,21 @@ async fn run_download(
             return Err(AppError::BadRequest("download cancelled".into()));
         }
         use tokio::io::AsyncWriteExt;
+        // Never let a download exceed the server disk limit (wings
+        // enforces the limit on every write through the filesystem layer).
+        if disk_limit > 0 && written + chunk.len() as u64 > disk_limit {
+            drop(out);
+            let _ = std::fs::remove_file(dest);
+            return Err(AppError::BadRequest(
+                "download exceeds the server disk limit".into(),
+            ));
+        }
         out.write_all(&chunk)
             .await
             .map_err(|e| AppError::BadRequest(format!("write failed: {e}")))?;
         written += chunk.len() as u64;
         if total > 0 {
             dl.set_progress(written as f64 / total as f64);
-        } else {
-            dl.set_progress(1.0);
         }
     }
     out.flush().await.map_err(|e| AppError::BadRequest(format!("flush failed: {e}")))?;
