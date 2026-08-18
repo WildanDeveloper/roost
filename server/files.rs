@@ -286,12 +286,14 @@ pub fn rel(&self, abs: &Path) -> String {
     }
 
     /// Chown a single path to the container user (wings `chownFile`).
+    /// Uses lchown: a symlink is chowned as a link, never followed (wings
+    /// Lchownat with AT_SYMLINK_NOFOLLOW).
     pub fn chown(&self, p: &Path) {
-        use std::os::unix::fs::chown as unix_chown;
+        use std::os::unix::fs::lchown as unix_lchown;
         let uid = self.chown_uid.load(std::sync::atomic::Ordering::SeqCst);
         let gid = self.chown_gid.load(std::sync::atomic::Ordering::SeqCst);
         if uid >= 0 && gid >= 0 {
-            let _ = unix_chown(p, Some(uid as u32), Some(gid as u32));
+            let _ = unix_lchown(p, Some(uid as u32), Some(gid as u32));
         }
     }
 

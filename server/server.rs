@@ -41,12 +41,24 @@ impl ServerState {
     }
 }
 
-/// Snapshot of the previous docker cpu stats, for cpu_absolute deltas.
-#[derive(Default, Clone, Copy)]
-#[allow(dead_code)]
-pub struct CpuPrev {
-    pub total: u64,
-    pub system: u64,
+/// Stateful window for the console throttler (wings `ConsoleThrottle`).
+struct ThrottleState {
+    count: u64,
+    last: std::time::Instant,
+    /// True between the first denied line and the next allowed line, so the
+    /// "outputting too quickly" notice fires once per episode (wings
+    /// `strike` + `locker`).
+    struck: bool,
+}
+
+impl Default for ThrottleState {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            last: std::time::Instant::now(),
+            struck: false,
+        }
+    }
 }
 
 /// One managed server on this node.
@@ -86,11 +98,13 @@ pub struct Server {
 
     /// Latest computed resource usage.
     usage: RwLock<ResourceUsage>,
-    cpu_prev: Mutex<CpuPrev>,
     started_at: Mutex<Option<Instant>>,
 
     /// Serializes power actions for this server.
     power_lock: Mutex<()>,
+    /// Stateful console throttler window (wings `ConsoleThrottle` — the
+    /// period is continuous, not per-call).
+    throttle: Mutex<ThrottleState>,
     /// stdin endpoint for console commands.
     console_tx: RwLock<Option<tokio::sync::mpsc::Sender<String>>>,
     stats_running: AtomicBool,
@@ -125,6 +139,13 @@ impl Server {
     pub fn new(data: RawServerData, shared: &ManagerShared, data_dir: PathBuf) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         let denylist = data.settings.egg.file_denylist.clone();
+        // websocket_log_count from the daemon config (wings
+        // WebsocketLogCount, default 150).
+        let log_count = shared
+            .daemon
+            .try_read()
+            .map(|c| c.system.websocket_log_count)
+            .unwrap_or(150);
 
         Self {
             uuid: data.uuid,
@@ -142,11 +163,11 @@ impl Server {
             panel: shared.panel.clone(),
             events,
             logs: RwLock::new(VecDeque::new()),
-            log_count: 150,
+            log_count,
             usage: RwLock::new(ResourceUsage::offline()),
-            cpu_prev: Mutex::new(CpuPrev::default()),
             started_at: Mutex::new(None),
             power_lock: Mutex::new(()),
+            throttle: Mutex::new(ThrottleState::default()),
             console_tx: RwLock::new(None),
             stats_running: AtomicBool::new(false),
             ws_connections: AtomicUsize::new(0),
@@ -191,7 +212,9 @@ impl Server {
 
     /// Push raw console bytes; emit complete lines to the log buffer and
     /// the broadcast channel. Implements wings console throttling: if
-    /// throttles.enabled, limits lines per period to prevent log flooding.
+    /// throttles.enabled, limits lines per period with a stateful window
+    /// (wings `ConsoleThrottle.Allow` — the count resets only when the
+    /// period has elapsed, so flooding across calls is still limited).
     pub async fn push_console_bytes(&self, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
         let (throttle_enabled, max_lines, reset_ms) = {
@@ -199,21 +222,33 @@ impl Server {
             let t = &daemon.throttles;
             (t.enabled, t.lines, t.line_reset_interval)
         };
-        let mut line_count: u64 = 0;
-        let period_start = Instant::now();
         for raw in text.split('\n') {
             let line = raw.trim_end_matches('\r').to_string();
             if line.is_empty() {
                 continue;
             }
             if throttle_enabled {
-                line_count += 1;
-                if line_count > max_lines && period_start.elapsed() < Duration::from_millis(reset_ms) {
+                let mut t = self.throttle.lock().await;
+                if t.last.elapsed() >= Duration::from_millis(reset_ms) {
+                    t.count = 0;
+                    t.last = Instant::now();
+                }
+                if t.count + 1 > max_lines {
+                    // Denied: fire the strike notice once per episode.
+                    if !t.struck {
+                        t.struck = true;
+                        let notice = "Server is outputting console data too quickly -- throttling...";
+                        let mut logs = self.logs.write().await;
+                        if logs.len() >= self.log_count {
+                            logs.pop_front();
+                        }
+                        logs.push_back(notice.to_string());
+                        self.publish(ServerEvent::ConsoleOutput(notice.to_string()));
+                    }
                     continue;
                 }
-                if line_count > max_lines {
-                    line_count = 0;
-                }
+                t.count += 1;
+                t.struck = false;
             }
             {
                 let mut logs = self.logs.write().await;
@@ -343,9 +378,6 @@ pub async fn disk_bytes(&self) -> u64 {
         let online = cpu_stats.online_cpus.unwrap_or(1);
         let prev_total = precpu.cpu_usage.total_usage;
         let prev_system = precpu.system_cpu_usage.unwrap_or(system);
-
-        let prev = CpuPrev { total: prev_total, system: prev_system };
-        *self.cpu_prev.lock().await = prev;
 
         let cpu_absolute = if system > prev_system && total >= prev_total {
             ((total - prev_total) as f64 / (system - prev_system) as f64) * online as f64 * 100.0
@@ -704,7 +736,12 @@ pub async fn disk_bytes(&self) -> u64 {
 
         // Always destroy and re-create the container before boot so synced
         // panel data is applied and logs are truncated (wings OnBeforeStart).
-        self.ensure_container_fresh().await?;
+        // On any failure the state must return to Offline, like wings
+        // Environment.Start's deferred ProcessOffline.
+        if let Err(e) = self.ensure_container_fresh().await {
+            self.set_state(ServerState::Offline).await;
+            return Err(e);
+        }
 
         {
             let daemon = self.daemon.read().await.clone();
@@ -723,7 +760,10 @@ pub async fn disk_bytes(&self) -> u64 {
         };
         crate::server::console::start_console(self.clone(), stream).await;
 
-        self.docker.start(&self.uuid.to_string()).await?;
+        if let Err(e) = self.docker.start(&self.uuid.to_string()).await {
+            self.set_state(ServerState::Offline).await;
+            return Err(e);
+        }
         *self.started_at.lock().await = Some(Instant::now());
         self.set_state(ServerState::Running).await;
         // Apply resource limits in-place after boot (wings InSituUpdate).
@@ -1004,16 +1044,21 @@ pub fn ensure_dir(path: &Path) -> AppResult<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create {}: {e}", path.display())))
 }
-use std::os::unix::fs::chown as unix_chown;
 
+/// Recursively chown a directory tree. Symlinks are chowned as links and
+/// never descended or followed (wings WalkDirat + Lchownat with
+/// AT_SYMLINK_NOFOLLOW).
 fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) {
-    let _ = unix_chown(path, Some(uid), Some(gid));
+    use std::os::unix::fs::lchown as unix_lchown;
+    let _ = unix_lchown(path, Some(uid), Some(gid));
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
-            let _ = unix_chown(&p, Some(uid), Some(gid));
-            if p.is_dir() {
-                chown_recursive(&p, uid, gid);
+            let _ = unix_lchown(&p, Some(uid), Some(gid));
+            if let Ok(meta) = std::fs::symlink_metadata(&p) {
+                if meta.is_dir() {
+                    chown_recursive(&p, uid, gid);
+                }
             }
         }
     }
