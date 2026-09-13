@@ -167,13 +167,18 @@ impl Server {
             );
         }
 
+        // Wings reads `settings.suspended` at construction (Server.fromRemote);
+        // the first sync must not be the only place the flag is picked up,
+        // otherwise suspended servers briefly accept websocket auth at boot.
+        let suspended_at_boot = data.settings.suspended;
+
         Self {
             uuid: data.uuid,
             name: RwLock::new(data.settings.meta.name.clone()),
             state: RwLock::new(ServerState::Offline),
             config: RwLock::new(data.settings),
             process_config: RwLock::new(data.process_configuration.unwrap_or_default()),
-            suspended: AtomicBool::new(false),
+            suspended: AtomicBool::new(suspended_at_boot),
             installing: AtomicBool::new(false),
             restoring: AtomicBool::new(false),
             intentional_stop: AtomicBool::new(false),
@@ -314,8 +319,11 @@ impl Server {
             if stop.r#type == "command" && !stop.value.is_empty() && line == stop.value {
                 drop(process);
                 // The user stopped the process via a console command; mark
-                // offline now so the exit is never treated as a crash.
+                // offline now (wings listeners.go sets ProcessOfflineState on
+                // the stop command "otherwise crash detection will kick in")
+                // so the exit is never treated as a crash.
                 tracing::info!(uuid = %self.uuid, "detected stop command in console output");
+                self.intentional_stop.store(true, Ordering::SeqCst);
                 self.set_state(ServerState::Offline).await;
             }
         }
@@ -801,8 +809,6 @@ pub async fn disk_bytes(&self) -> u64 {
         };
         chown_recursive(self.fs.root(), uid, gid);
 
-        let image = self.config.read().await.container.image.clone();
-
         // Always destroy and re-create the container before boot so synced
         // panel data is applied and logs are truncated (wings OnBeforeStart).
         // On any failure the state must return to Offline, like wings
@@ -810,14 +816,6 @@ pub async fn disk_bytes(&self) -> u64 {
         if let Err(e) = self.ensure_container_fresh().await {
             self.set_state(ServerState::Offline).await;
             return Err(e);
-        }
-
-        {
-            let daemon = self.daemon.read().await.clone();
-            let docker_cfg = daemon.docker.clone();
-            if let Err(e) = self.docker.pull_image(&image, &docker_cfg).await {
-                tracing::warn!(uuid = %self.uuid, image = %image, error = %e, "image unavailable");
-            }
         }
 
         let stream = match self.docker.attach(&self.uuid.to_string()).await {
@@ -911,6 +909,13 @@ pub async fn disk_bytes(&self) -> u64 {
     async fn handle_server_crash(self: Arc<Self>, exit_code: Option<i64>) {
         let srv_cfg = self.config.read().await.clone();
         let daemon_cfg = self.daemon.read().await.clone();
+        // Wings only runs crash detection while the server is actually
+        // offline (crash.go: "no point in doing anything here if the server
+        // isn't currently offline") — a server that was restarted or stopped
+        // intentionally in the meantime must not be touched.
+        if self.query_state().await != ServerState::Offline {
+            return;
+        }
         if !srv_cfg.crash_detection_enabled || !daemon_cfg.system.crash_detection.enabled {
             return;
         }
