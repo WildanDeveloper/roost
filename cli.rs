@@ -51,7 +51,7 @@ fn parse_flags(args: &[String], with_values: &[&'static str], switches: &[&'stat
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        let name = a.trim_start_matches("--");
+        let name = a.trim_start_matches('-');
         let alias = match name {
             "p" => "panel-url",
             "t" => "token",
@@ -200,7 +200,19 @@ fn configure(args: &[String]) -> i32 {
             return 1;
         }
     }
-    if let Err(e) = std::fs::write(&config_path, yaml) {
+    if let Err(e) = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            // Wings config pushes persist with 0600 — the daemon token is
+            // world-readable at 0644.
+            .mode(0o600)
+            .open(&config_path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+    } {
         eprintln!("Failed to write {config_path}: {e}");
         return 1;
     }
@@ -375,16 +387,34 @@ fn collect_diagnostics(
             writeln!(out, "== Server States ({}) ==", states_path.display()).unwrap();
             writeln!(out, "  {}", states).unwrap();
         }
-        // Logs, sanitized of anything token-looking.
+        // Logs, sanitized of anything token-looking (wings diagnostics.go
+        // replaces the panel location, API host and other known values
+        // before writing logs into the report).
         writeln!(out, "== Latest Roost Logs ==").unwrap();
         if include_logs {
             let log_path = cfg.log_dir().join("roost.log");
             match std::fs::read_to_string(&log_path) {
                 Ok(content) => {
+                    let redact = |s: &str| -> String {
+                        let mut s = s.to_string();
+                        if !cfg.token.is_empty() {
+                            s = s.replace(&cfg.token, "{redacted}");
+                        }
+                        if !cfg.token_id.is_empty() {
+                            s = s.replace(&cfg.token_id, "{redacted}");
+                        }
+                        if !cfg.remote.is_empty() {
+                            s = s.replace(&cfg.remote, "{redacted}");
+                        }
+                        if !cfg.api.host.is_empty() {
+                            s = s.replace(&cfg.api.host, "{redacted}");
+                        }
+                        s
+                    };
                     let tail: Vec<&str> = content.lines().collect();
                     let start = tail.len().saturating_sub(log_lines);
                     for line in &tail[start..] {
-                        writeln!(out, "  {line}").unwrap();
+                        writeln!(out, "  {}", redact(line)).unwrap();
                     }
                 }
                 Err(_) => writeln!(out, "  No logs found or an error occurred.").unwrap(),
