@@ -244,7 +244,10 @@ pub fn rel(&self, abs: &Path) -> String {
 
     // ---- files ---------------------------------------------------------------
 
-    pub fn read(&self, path: &str) -> AppResult<Vec<u8>> {
+    /// Open a file for reading (wings `Filesystem.File`): O_NOFOLLOW +
+    /// O_NONBLOCK, named pipes refused, resolved + denylist-checked. Used
+    /// by the contents endpoint to stream the body instead of buffering it.
+    pub fn open_read(&self, path: &str) -> AppResult<(std::fs::File, u64)> {
         let p = self.resolve(path)?;
         self.check_denied(path)?;
         self.assert_contained(&p)?;
@@ -253,7 +256,7 @@ pub fn rel(&self, abs: &Path) -> String {
         // blocks; the fstat below rejects anything that is not a regular
         // file (O_NOFOLLOW already refused symlinks at open time).
         use nix::fcntl::OFlag;
-        let mut file = self.open_no_follow(&p, OFlag::O_RDONLY | OFlag::O_NONBLOCK, nix::sys::stat::Mode::empty())?;
+        let file = self.open_no_follow(&p, OFlag::O_RDONLY | OFlag::O_NONBLOCK, nix::sys::stat::Mode::empty())?;
         let meta = file
             .metadata()
             .map_err(|e| AppError::BadRequest(format!("cannot stat {path}: {e}")))?;
@@ -262,10 +265,7 @@ pub fn rel(&self, abs: &Path) -> String {
                 "refusing to read {path}: not a regular file"
             )));
         }
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut buf)
-            .map_err(|e| AppError::BadRequest(format!("cannot read {path}: {e}")))?;
-        Ok(buf)
+        Ok((file, meta.len()))
     }
 
     pub fn write(&self, path: &str, bytes: &[u8]) -> AppResult<()> {
@@ -420,6 +420,8 @@ pub fn rel(&self, abs: &Path) -> String {
     pub fn compress(&self, root: &str, files: &[String]) -> AppResult<FileStat> {
         let base = self.resolve(root)?;
         for f in files {
+            // Wings checks the denylist on compress (compress.go IsIgnored).
+            self.check_denied(f)?;
             let p = self.resolve_under(&base, f)?;
             self.assert_contained(&p)?;
         }
@@ -679,6 +681,16 @@ mod uuids {
     //! functions compress/extract tar.gz archives.
         use std::path::Path;
 
+    /// Single-file compression formats (used for tar auto-detection).
+    #[derive(Clone, Copy)]
+    enum Compression {
+        Gzip,
+        Bzip2,
+        Xz,
+        Zstd,
+        Lz4,
+    }
+
     pub fn archive(root: &Path, dir: &str, files: &[String]) -> std::io::Result<std::path::PathBuf> {
         let base = root.join(dir.trim_start_matches('/'));
         let archive_name = format!("archive-{}.tar.gz", uuid::Uuid::new_v4());
@@ -795,9 +807,12 @@ mod uuids {
         Ok(0)
     }
 
-    /// Extract a user-facing archive (zip / tar / tar.gz / plain gz) into
-    /// `base`, wing-style: paths are used as-is, symlinks inside tar
-    /// archives are honored, and path traversal is blocked.
+    /// Extract a user-facing archive into `base`, wing-style: paths are
+    /// used as-is, symlinks inside tar archives are honored, and path
+    /// traversal is blocked. Supported: zip, tar, tar.{gz,bz2,xz,zst,lz4}
+    /// and the single-file compressions (.gz/.bz2/.xz/.zst/.lz4, with tar
+    /// contents auto-detected) plus .7z. RAR is explicitly refused (no
+    /// dependable pure-Rust decoder).
     pub fn extract_user_archive(archive: &Path, base: &Path) -> std::io::Result<()> {
         let name = archive
             .file_name()
@@ -813,10 +828,34 @@ mod uuids {
             return Ok(());
         }
 
+        if name.ends_with(".7z") {
+            sevenz_rust::decompress_file(archive, base)
+                .map_err(|e| std::io::Error::other(format!("cannot extract 7z: {e}")))?;
+            return Ok(());
+        }
+
+        // tar.{gz,bz2,xz,zst,lz4} (+ legacy double-suffix aliases)
         if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
             let file = std::fs::File::open(archive)?;
-            let gz = flate2::read::GzDecoder::new(file);
-            return extract_tar(gz, base);
+            return extract_tar(flate2::read::GzDecoder::new(file), base);
+        }
+        if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") || name.ends_with(".tbz") {
+            let file = std::fs::File::open(archive)?;
+            return extract_tar(bzip2::read::BzDecoder::new(file), base);
+        }
+        if name.ends_with(".tar.xz") || name.ends_with(".txz") {
+            let file = std::fs::File::open(archive)?;
+            let xz = xz2::read::XzDecoder::new(file);
+            return extract_tar(xz, base);
+        }
+        if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+            let file = std::fs::File::open(archive)?;
+            let zst = zstd::stream::read::Decoder::new(file)?;
+            return extract_tar(zst, base);
+        }
+        if name.ends_with(".tar.lz4") {
+            let file = std::fs::File::open(archive)?;
+            return extract_tar(lz4_flex::frame::FrameDecoder::new(file), base);
         }
 
         if name.ends_with(".tar") {
@@ -824,22 +863,37 @@ mod uuids {
             return extract_tar(file, base);
         }
 
-        if name.ends_with(".gz") {
-            let mut file = std::fs::File::open(archive)?;
-            if is_tar(&mut file)? {
-                let gz = flate2::read::GzDecoder::new(file);
-                return extract_tar(gz, base);
+        // Single-file compressions; tar contents are auto-detected from the
+        // decompressed stream (wings identifies the archive format first).
+        for (ext, kind) in [
+            (".gz", Compression::Gzip),
+            (".bz2", Compression::Bzip2),
+            (".xz", Compression::Xz),
+            (".zst", Compression::Zstd),
+            (".lz4", Compression::Lz4),
+        ] {
+            if !name.ends_with(ext) {
+                continue;
             }
-            // Single-file compression: write `<name>` minus the .gz suffix.
+            let file = std::fs::File::open(archive)?;
+            if is_tar_compressed(file, kind)? {
+                let file = std::fs::File::open(archive)?;
+                return extract_tar(decompress_reader(file, kind)?, base);
+            }
+            // Single-file compression: write `<name>` minus the suffix.
             let stripped = archive
                 .file_name()
-                .map(|s| s.to_string_lossy().replace(".gz", ""))
+                .map(|s| {
+                    let lossy = s.to_string_lossy();
+                    lossy.strip_suffix(ext).unwrap_or(&lossy).to_string()
+                })
                 .unwrap_or_default();
             let dest = base.join(stripped);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut decoder = flate2::read::GzDecoder::new(file);
+            let file = std::fs::File::open(archive)?;
+            let mut decoder = decompress_reader(file, kind)?;
             let mut out = std::fs::File::create(&dest)?;
             std::io::copy(&mut decoder, &mut out)?;
             return Ok(());
@@ -856,18 +910,54 @@ mod uuids {
             .filter_map(|e| e.ok())
             .try_for_each(|mut entry| -> std::io::Result<()> {
                 let entry_path = entry.path()?.into_owned();
-                let dest = base.join(&entry_path);
-                // Guard against path traversal inside the archive.
-                if !dest.starts_with(base) {
+                // Guard against path traversal inside the archive: entries
+                // carrying `..` components are skipped (same check the
+                // backup extraction path applies).
+                if entry_path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
                     return Ok(());
                 }
+                let dest = base.join(&entry_path);
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 entry.unpack(&dest).map(|_| ())
             })
     }
+
+    /// Decompress the first 512 bytes and check for a tar header (ustar
+    /// magic at offset 257) — single-file compressions may wrap a tar.
+    fn is_tar_compressed(file: std::fs::File, kind: Compression) -> std::io::Result<bool> {
+        use std::io::Read;
+        let mut decoder = decompress_reader(file, kind)?;
+        let mut buf = vec![0u8; 512];
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = decoder.read(&mut buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled >= 262 && &buf[257..262] == b"ustar")
+    }
+
+    fn decompress_reader(
+        file: std::fs::File,
+        kind: Compression,
+    ) -> std::io::Result<Box<dyn std::io::Read>> {
+        Ok(match kind {
+            Compression::Gzip => Box::new(flate2::read::GzDecoder::new(file)),
+            Compression::Bzip2 => Box::new(bzip2::read::BzDecoder::new(file)),
+            Compression::Xz => Box::new(xz2::read::XzDecoder::new(file)),
+            Compression::Zstd => Box::new(zstd::stream::read::Decoder::new(file)?),
+            Compression::Lz4 => Box::new(lz4_flex::frame::FrameDecoder::new(file)),
+        })
+    }
 }
+
 
 /// Minimal glob matcher supporting `*`, `**` and `?`, used for the file
 /// denylist (wings matches it with gitignore semantics via
