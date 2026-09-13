@@ -3,8 +3,9 @@ use crate::models::ServerBuild;
 
 /// Computed Docker resource limits for a container, mirroring
 /// wings `environment/settings.go`:
-/// - memory overhead multiplier: 1.15 for <=2GiB, 1.10 for <=4GiB, else 1.05
-///   (or whatever the `docker.overhead` config says)
+/// - memory overhead multiplier: built-in tiers (1.15 for <=2GiB, 1.10 for
+///   <=4GiB, else 1.05), or the `docker.overhead.multipliers` map when
+///   `docker.overhead.override` is set
 /// - memory_swap = swap + bounded memory (swap -1 => unlimited)
 /// - cpu_quota = cpu_limit * period / 100 when cpu_limit > 0
 #[derive(Debug, Clone, Default)]
@@ -22,19 +23,33 @@ pub struct ContainerResources {
 }
 
 impl ServerBuild {
-    /// Memory overhead multiplier from `docker.overhead`.
+    /// Memory overhead multiplier from `docker.overhead` — mirrors wings
+    /// `Overhead.GetMultiplier`: without `override` the built-in tiers
+    /// apply (1.15 for ≤2048 MB, 1.10 for ≤4096 MB, else 1.05); with
+    /// `override` the configured `multipliers` map is used (smallest key
+    /// whose limit covers the server memory), falling back to
+    /// `default_multiplier`.
     fn memory_overhead_multiplier(&self, docker: &DockerConfig) -> f32 {
         let overhead = &docker.overhead;
-        if overhead.override_multiplier {
-            return overhead.default_multiplier;
+        if !overhead.override_multiplier {
+            if self.memory_limit <= 2048 {
+                return 1.15;
+            } else if self.memory_limit <= 4096 {
+                return 1.10;
+            }
+            return 1.05;
         }
-        let mut best = overhead.default_multiplier;
-        for m in &overhead.multipliers {
-            if self.memory_limit >= m.memory {
-                best = m.overhead;
+        let mut keys: Vec<i64> = overhead.multipliers.iter().map(|m| m.memory).collect();
+        keys.sort_unstable();
+        for key in keys {
+            if self.memory_limit > key {
+                continue;
+            }
+            if let Some(m) = overhead.multipliers.iter().find(|m| m.memory == key) {
+                return m.overhead;
             }
         }
-        best
+        overhead.default_multiplier
     }
 
     /// Bounded memory limit in bytes (limit * overhead multiplier).
@@ -117,4 +132,71 @@ fn blkio_weight_supported() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Multiplier, OverheadConfig};
+
+    fn docker_with(overhead: OverheadConfig) -> DockerConfig {
+        DockerConfig {
+            overhead,
+            ..Default::default()
+        }
+    }
+
+    fn build(memory_limit: i64) -> ServerBuild {
+        ServerBuild {
+            memory_limit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_tiers_ignore_multipliers() {
+        let mut overhead = OverheadConfig::default();
+        overhead.multipliers.push(Multiplier {
+            memory: 1,
+            overhead: 9.9,
+        });
+        let docker = docker_with(overhead);
+        let cases = [
+            (1024, 1.15),
+            (2048, 1.15),
+            (2049, 1.10),
+            (4096, 1.10),
+            (4097, 1.05),
+            (16384, 1.05),
+        ];
+        for (memory, want) in cases {
+            let got = build(memory).memory_overhead_multiplier(&docker);
+            assert!((got - want).abs() < 1e-6, "memory={memory} got={got} want={want}");
+        }
+    }
+
+    #[test]
+    fn override_uses_multiplier_map() {
+        let mut overhead = OverheadConfig {
+            override_multiplier: true,
+            default_multiplier: 1.05,
+            ..Default::default()
+        };
+        overhead.multipliers = vec![
+            Multiplier {
+                memory: 4096,
+                overhead: 1.10,
+            },
+            Multiplier {
+                memory: 2048,
+                overhead: 1.15,
+            },
+        ];
+        let docker = docker_with(overhead);
+        // Unsorted map: smallest key covering the limit wins.
+        assert!((build(1024).memory_overhead_multiplier(&docker) - 1.15).abs() < 1e-6);
+        assert!((build(3000).memory_overhead_multiplier(&docker) - 1.10).abs() < 1e-6);
+        // Above every key: fall back to the default multiplier.
+        assert!((build(8192).memory_overhead_multiplier(&docker) - 1.05).abs() < 1e-6);
+    }
 }
