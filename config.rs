@@ -324,13 +324,13 @@ impl Config {
     /// bundled example so defaults are sensible.
     pub fn load(path: impl AsRef<Path>) -> AppResult<Self> {
         let path = path.as_ref();
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "config file not readable ({e}), using defaults");
-                Self::DEFAULTS.to_string()
-            }
-        };
+        // Wings fails hard when the configuration file is missing or
+        // unreadable (config.FromFile returns the error and cmd/root.go
+        // aborts) — a silent default fallback would boot the daemon with a
+        // known token.
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            AppError::Config(format!("cannot read config file {}: {e}", path.display()))
+        })?;
 
         let mut cfg: Config = serde_yaml::from_str(&content)
             .map_err(|e| AppError::Config(format!("invalid YAML in {}: {e}", path.display())))?;
@@ -434,8 +434,11 @@ impl Config {
             return Ok(());
         }
         let log_file = self.log_dir().join("roost.log");
+        // copytruncate: logrotate copies then truncates the active file, so
+        // rotation works without the writer reopening (HUP does nothing for
+        // tracing_appender's non_blocking writer).
         let contents = format!(
-            "{} {{\n    size 10M\n    compress\n    delaycompress\n    dateext\n    maxage 7\n    missingok\n    notifempty\n    postrotate\n        /usr/bin/systemctl kill -s HUP roost.service >/dev/null 2>&1 || true\n    endscript\n}}\n",
+            "{} {{\n    size 10M\n    copytruncate\n    compress\n    delaycompress\n    dateext\n    maxage 7\n    missingok\n    notifempty\n}}\n",
             log_file.display()
         );
         std::fs::write(&conf, contents).map_err(|e| {
@@ -522,7 +525,22 @@ fn expand_value(input: &str) -> String {
             });
     }
     if let Some(rest) = input.strip_prefix('$') {
-        let name = rest.trim_matches(|c| c == '{' || c == '}');
+        // `${VAR}` or `$VAR` — only valid identifier characters are part of
+        // the variable name (`$A.B` must not swallow the `.B`).
+        let name: String = match rest.strip_prefix('{') {
+            Some(braced) => braced
+                .split('}')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            None => rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect(),
+        };
+        if name.is_empty() {
+            return input;
+        }
         return std::env::var(name).unwrap_or_default();
     }
     input
