@@ -98,11 +98,12 @@ pub async fn parse_token(
 
     // Revocation checks mirror wings isDenylisted: only tokens that carry
     // both server_uuid and user_uuid (websocket/file/backup) are checked;
-    // transfer tokens (sub + scope only) are not.
-    let iat = claims.iat;
+    // transfer tokens (sub + scope only) are not. A missing `iat` is treated
+    // as 0 so the checks can never be silently skipped.
     let su = claims.server_uuid();
     let uu = claims.user_uuid.as_deref();
-    if let (Some(iat), Some(_su), Some(uu)) = (iat, su, uu) {
+    if let (Some(_su), Some(uu)) = (su, uu) {
+        let iat = claims.iat.unwrap_or(0);
         if iat < boot_time {
             return Err(AppError::Unauthorized("jwt created too far in past (denylist)".to_string()));
         }

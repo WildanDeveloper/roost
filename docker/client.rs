@@ -827,6 +827,12 @@ fn registry_auth_for(image: &str, registries: &[RegistryConfig]) -> Option<Docke
 }
 
 fn split_image_tag(image: &str) -> (&str, Option<&str>) {
+    // Digest references (`img@sha256:...`) carry no tag: split the digest
+    // off first (wings uses distribution/reference for this).
+    let image = match image.split_once('@') {
+        Some((base, _digest)) => base,
+        None => image,
+    };
     if let Some((base, tag)) = image.rsplit_once(':') {
         if !tag.contains('/') {
             return (base, Some(tag));
