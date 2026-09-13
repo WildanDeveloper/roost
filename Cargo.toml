@@ -1,6 +1,6 @@
 [package]
 name = "roost"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Pterodactyl Wings-compatible daemon written in Rust"
 autobins = false
