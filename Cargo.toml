@@ -76,4 +76,6 @@ russh = "0.62"
 tokio-util = "0.7.19"
 
 [profile.release]
-lto = true
+# Fat LTO OOM-kills on 8 GB hosts; thin keeps most of the win at a
+# fraction of the peak memory.
+lto = "thin"
