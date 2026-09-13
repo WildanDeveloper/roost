@@ -1,0 +1,19 @@
+[Unit]
+Description=Pterodactyl Roost Daemon (Wings-compatible)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+Environment=ROOST_CONFIG=/etc/pterodactyl/config.yml
+ExecStart=/usr/local/bin/roost
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

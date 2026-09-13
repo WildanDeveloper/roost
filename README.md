@@ -55,8 +55,32 @@ the official daemon — no panel modifications required.
 
 Requires **Rust 1.75+** (build) and a working **Docker daemon** (runtime).
 
+### One-line install (like the Wings community installer)
+
 ```bash
-# build
+sudo bash <(curl -s https://raw.githubusercontent.com/WildanDeveloper/roost/master/install.sh)
+```
+
+Downloads the release binary for your architecture, verifies its SHA-256
+checksum, installs Docker if missing, creates the Pterodactyl directory
+layout, installs and enables the `roost` systemd service, then walks you
+through registering the node against your panel. If Wings is already
+installed on the node, the installer stops with instructions — both
+daemons cannot share a machine.
+
+Non-interactive (headless) mode:
+
+```bash
+sudo ROOST_PANEL_URL=https://panel.example.com \
+     ROOST_PANEL_TOKEN=<application-api-key> \
+     ROOST_NODE_ID=1 \
+     ROOST_AUTO_START=true \
+     bash <(curl -s https://raw.githubusercontent.com/WildanDeveloper/roost/master/install.sh)
+```
+
+### Build from source
+
+```bash
 git clone https://github.com/WildanDeveloper/roost.git
 cd roost
 cargo build --release

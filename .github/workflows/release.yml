@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: amd64
+            runner: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+          - target: arm64
+            runner: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.rust-target }}
+
+      - name: Stage release assets
+        run: |
+          cp "target/${{ matrix.rust-target }}/release/roost" "roost_linux_${{ matrix.target }}"
+          chmod 755 "roost_linux_${{ matrix.target }}"
+          sha256sum "roost_linux_${{ matrix.target }}" > "roost_linux_${{ matrix.target }}.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            roost_linux_${{ matrix.target }}
+            roost_linux_${{ matrix.target }}.sha256
+          generate_release_notes: true
