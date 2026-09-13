@@ -151,7 +151,7 @@ struct SshHandler {
     peer: SocketAddr,
     session_id: Vec<u8>,
     client_version: Arc<Mutex<Option<Vec<u8>>>>,
-    session_token: tokio_util::sync::CancellationToken,
+    session_token: std::sync::Arc<tokio_util::sync::CancellationToken>,
     authed: Option<Authed>,
     session_channel: Option<Channel<russh::server::Msg>>,
 }
@@ -160,7 +160,7 @@ impl SshHandler {
     fn new(
         srv: Arc<SftpServer>,
         peer: SocketAddr,
-        session_token: tokio_util::sync::CancellationToken,
+        session_token: std::sync::Arc<tokio_util::sync::CancellationToken>,
         client_version: Arc<Mutex<Option<Vec<u8>>>>,
     ) -> Self {
         Self {
@@ -460,6 +460,57 @@ impl SftpFs {
             match comp {
                 "" | "." => continue,
                 ".." => return Err(sr(StatusCode::NoSuchFile, "invalid path")),
+                c => out.push(c),
+            }
+        }
+        // Wings opens paths through unixFS with a per-component NOFOLLOW
+        // walk: an intermediate symlink planted inside the data directory
+        // must never be followed out of it. Walk every component below the
+        // root and refuse the moment one is a symlink.
+        let mut walk = self.root.clone();
+        for comp in out.components().skip(self.root.components().count()) {
+            walk.push(comp);
+            if let Ok(meta) = std::fs::symlink_metadata(&walk) {
+                if meta.file_type().is_symlink() {
+                    return Err(sr(
+                        StatusCode::NoSuchFile,
+                        "cannot follow symlinks inside the server directory",
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a symlink target the way wings' unixFS validates it: the
+    /// target must resolve inside the server home directory. Relative
+    /// targets are interpreted relative to the directory containing the
+    /// link; absolute targets are checked as-is.
+    fn resolve_target(&self, linkpath: &str, targetpath: &str) -> Result<PathBuf, StatusReply> {
+        if targetpath.starts_with('/') {
+            // Absolute target: must stay inside the root.
+            let mut out = self.root.clone();
+            for comp in targetpath.trim_start_matches('/').split('/') {
+                match comp {
+                    "" | "." => continue,
+                    ".." => return Err(sr(StatusCode::NoSuchFile, "invalid symlink target")),
+                    c => out.push(c),
+                }
+            }
+            return Ok(out);
+        }
+
+        // Relative target: resolve against the link's directory.
+        let link_dir = linkpath
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or_default();
+        let mut out = self
+            .resolve(if link_dir.is_empty() { "." } else { link_dir })?;
+        for comp in targetpath.split('/') {
+            match comp {
+                "" | "." => continue,
+                ".." => return Err(sr(StatusCode::NoSuchFile, "invalid symlink target")),
                 c => out.push(c),
             }
         }
@@ -937,7 +988,10 @@ impl SftpFsHandler for SftpFs {
                 return Err(sr(StatusCode::PermissionDenied, "missing file.create"));
             }
             let link = self.resolve(&linkpath)?;
-            std::os::unix::fs::symlink(&targetpath, &link).map_err(io_err)?;
+            // Wings: symlinks are only allowed between files that resolve
+            // inside the server home directory (sftp/handler.go Symlink).
+            let target = self.resolve_target(&linkpath, &targetpath)?;
+            std::os::unix::fs::symlink(&target, &link).map_err(io_err)?;
             Ok(status_ok(_id))
         })();
         async move { result }
@@ -963,7 +1017,7 @@ pub struct SftpServer {
     data_dir: PathBuf,
     /// Active SFTP sessions keyed by server uuid, so installs can abort
     /// them (mirrors wings `Sftp().CancelAll()`).
-    sessions: tokio::sync::Mutex<HashMap<String, Vec<tokio_util::sync::CancellationToken>>>,
+    sessions: tokio::sync::Mutex<HashMap<String, Vec<std::sync::Arc<tokio_util::sync::CancellationToken>>>>,
 }
 
 impl SftpServer {
@@ -1034,7 +1088,11 @@ impl SftpServer {
 
     /// Track an authenticated SFTP session under its server uuid so
     /// installs can abort it (wings `Sftp().CancelAll()`).
-    pub async fn register_session(&self, uuid: &str, token: tokio_util::sync::CancellationToken) {
+    pub async fn register_session(
+        &self,
+        uuid: &str,
+        token: std::sync::Arc<tokio_util::sync::CancellationToken>,
+    ) {
         self.sessions
             .lock()
             .await
@@ -1045,13 +1103,14 @@ impl SftpServer {
 
     /// Stop tracking a session. Idempotent: safe to call from both the
     /// channel task and the handler Drop (non-blocking try_lock).
-    pub fn unregister_session(&self, uuid: &str, token: &tokio_util::sync::CancellationToken) {
+    pub fn unregister_session(
+        &self,
+        uuid: &str,
+        token: &std::sync::Arc<tokio_util::sync::CancellationToken>,
+    ) {
         if let Ok(mut sessions) = self.sessions.try_lock() {
             if let Some(v) = sessions.get_mut(uuid) {
-                v.retain(|t| !std::ptr::eq::<tokio_util::sync::CancellationToken>(
-                    &*t as *const _,
-                    token,
-                ));
+                v.retain(|t| !std::sync::Arc::ptr_eq(t, token));
             }
         }
     }
@@ -1086,7 +1145,7 @@ impl SftpServer {
             let (stream, peer) = listener.accept().await?;
             let srv = self.clone();
             let config = config.clone();
-            let session_token = tokio_util::sync::CancellationToken::new();
+            let session_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
             let token_for_task = session_token.clone();
             tokio::spawn(async move {
                 let client_version = Arc::new(Mutex::new(None));
