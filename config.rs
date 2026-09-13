@@ -285,8 +285,14 @@ pub struct InstallerLimits {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OverheadConfig {
+    /// Wings YAML key is `override`; `override_multiplier` kept as alias.
+    #[serde(rename = "override", alias = "override_multiplier")]
     pub override_multiplier: bool,
     pub default_multiplier: f32,
+    #[serde(
+        deserialize_with = "de_multipliers",
+        serialize_with = "ser_multipliers"
+    )]
     pub multipliers: Vec<Multiplier>,
 }
 
@@ -521,6 +527,89 @@ fn expand_value(input: &str) -> String {
     }
     input
 }
+/// Accept `docker.overhead.multipliers` in both shapes: the wings map
+/// (`<memory_mb>: <multiplier>`, keys may be ints or numeric strings) and
+/// the sequence form (`[{memory, overhead}]`). Serialized back as a map
+/// with sorted integer keys to match wings.
+fn de_multipliers<'de, D>(deserializer: D) -> Result<Vec<Multiplier>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct MemoryKey(i64);
+
+    impl<'de> serde::Deserialize<'de> for MemoryKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = MemoryKey;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a memory limit in MB")
+                }
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<MemoryKey, E> {
+                    Ok(MemoryKey(v))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<MemoryKey, E> {
+                    Ok(MemoryKey(v as i64))
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<MemoryKey, E> {
+                    v.parse::<i64>()
+                        .map(MemoryKey)
+                        .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+            deserializer.deserialize_any(V)
+        }
+    }
+
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<Multiplier>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map or sequence of memory multipliers")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Vec<Multiplier>, A::Error> {
+            let mut out = Vec::new();
+            while let Some((MemoryKey(memory), overhead)) =
+                access.next_entry::<MemoryKey, f32>()?
+            {
+                out.push(Multiplier { memory, overhead });
+            }
+            Ok(out)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Vec<Multiplier>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(m) = access.next_element::<Multiplier>()? {
+                out.push(m);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_any(V)
+}
+
+fn ser_multipliers<S: serde::Serializer>(
+    multipliers: &[Multiplier],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut sorted: Vec<&Multiplier> = multipliers.iter().collect();
+    sorted.sort_by_key(|m| m.memory);
+    let mut map = serializer.serialize_map(Some(sorted.len()))?;
+    for m in sorted {
+        map.serialize_entry(&m.memory, &m.overhead)?;
+    }
+    map.end()
+}
+
 /// Accept `docker.registries` in both shapes the ecosystem produces:
 /// the wings map (`"<host>": {username, password}`) and the plain
 /// sequence form (`[{name, username, password}]`).
@@ -594,5 +683,48 @@ docker:
         let cfg: Config = serde_yaml::from_str(y).unwrap();
         assert_eq!(cfg.docker.registries[0].name, "docker.io");
         assert_eq!(cfg.docker.registries[0].username, "u");
+    }
+
+    #[test]
+    fn overhead_accepts_wings_map_shape() {
+        // Exactly what the panel generates, including an empty map.
+        let y = "docker:\n  overhead:\n    override: false\n    default_multiplier: 1.05\n    multipliers: {}\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert!(!cfg.docker.overhead.override_multiplier);
+        assert!(cfg.docker.overhead.multipliers.is_empty());
+
+        let y = "docker:\n  overhead:\n    override: true\n    default_multiplier: 1.05\n    multipliers:\n      2048: 1.15\n      4096: 1.10\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert!(cfg.docker.overhead.override_multiplier);
+        assert_eq!(cfg.docker.overhead.multipliers.len(), 2);
+        let m = cfg
+            .docker
+            .overhead
+            .multipliers
+            .iter()
+            .find(|m| m.memory == 4096)
+            .unwrap();
+        assert!((m.overhead - 1.10).abs() < 1e-6);
+
+        // String keys (JSON round-trips map keys as strings).
+        let y = "docker:\n  overhead:\n    multipliers:\n      \"2048\": 1.15\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert_eq!(cfg.docker.overhead.multipliers[0].memory, 2048);
+
+        // Legacy sequence form still accepted.
+        let y = "docker:\n  overhead:\n    multipliers:\n      - memory: 2048\n        overhead: 1.2\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert_eq!(cfg.docker.overhead.multipliers[0].overhead, 1.2);
+
+        // Round-trips back to the wings map shape.
+        let out = serde_yaml::to_string(&cfg.docker.overhead).unwrap();
+        assert!(out.contains("2048: 1.2"), "{out}");
+    }
+
+    #[test]
+    fn overhead_accepts_legacy_override_multiplier_key() {
+        let y = "docker:\n  overhead:\n    override_multiplier: true\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert!(cfg.docker.overhead.override_multiplier);
     }
 }

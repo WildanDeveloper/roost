@@ -92,13 +92,11 @@ docker:
     percent: 100
   cpu_shares: 0
   overhead:
-    override_multiplier: false
+    override: false
     default_multiplier: 1.05
     multipliers:
-      - memory: 2048
-        overhead: 1.15
-      - memory: 4096
-        overhead: 1.10
+      2048: 1.15
+      4096: 1.10
   use_performant_inspect: true
   userns_mode: ""
   log_config:
