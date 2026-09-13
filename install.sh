@@ -17,6 +17,10 @@ ROOST_GITHUB_REPO="WildanDeveloper/roost"
 ROOST_DL_BASE_URL="https://github.com/${ROOST_GITHUB_REPO}/releases/latest/download/roost_linux_"
 ROOST_BIN="/usr/local/bin/roost"
 ROOST_CONFIG_PATH="/etc/pterodactyl/config.yml"
+# Optional: install a locally built binary instead of a GitHub release
+# (ROOST_BINARY=/path/to/roost) — used by the combined panel+roost installer
+# and for testing before a release is published.
+ROOST_BINARY="${ROOST_BINARY:-}"
 
 # pretty output helpers
 
@@ -104,6 +108,17 @@ install_docker() {
 # binary
 
 download_binary() {
+  if [ -n "$ROOST_BINARY" ]; then
+    output "Installing local binary ${ROOST_BINARY}..."
+    if [ ! -x "$ROOST_BINARY" ]; then
+      error "ROOST_BINARY is set but not an executable file: $ROOST_BINARY"
+      exit 1
+    fi
+    install -m 755 "$ROOST_BINARY" "$ROOST_BIN"
+    success "roost installed to $ROOST_BIN (local binary)"
+    return 0
+  fi
+
   output "Downloading roost (linux_$ARCH)..."
 
   if ! curl -fsSL -o "$ROOST_BIN.tmp" "${ROOST_DL_BASE_URL}${ARCH}"; then
