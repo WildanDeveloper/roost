@@ -66,7 +66,11 @@ async fn get_server_logs(
     while let Some(item) = futures_util::StreamExt::next(&mut stream).await {
         match item {
             Ok(bollard::container::LogOutput::StdOut { message: bytes })
-            | Ok(bollard::container::LogOutput::StdErr { message: bytes }) => {
+            | Ok(bollard::container::LogOutput::StdErr { message: bytes })
+            // TTY containers (wings always sets Tty: true) deliver every
+            // line as Console — treat it as regular output (bollard
+            // yields StdOut/StdErr only for non-TTY containers).
+            | Ok(bollard::container::LogOutput::Console { message: bytes }) => {
                 for line in String::from_utf8_lossy(&bytes).split('\n') {
                     lines.push(line.trim_end_matches('\r').to_string());
                 }
@@ -300,11 +304,9 @@ async fn post_server_transfer(
             Err(e) => {
                 tracing::warn!(uuid = %task_server.uuid, error = %e, "outgoing transfer failed");
                 task_server.publish(crate::server::events::ServerEvent::TransferStatus("failure".into()));
+                // wings Transfer.Error: log + send the message to the console.
+                transfer_log(&task_server, "Failed to stream archive to destination.");
                 let _ = panel.read().await.post_transfer_status(task_server.uuid, false).await;
-                let srv = task_server.clone();
-                tokio::spawn(async move {
-                    srv.publish_daemon_message(format!("Transfer failed: {e}")).await;
-                });
             }
         }
         task_server.set_transferring(false);
@@ -312,6 +314,15 @@ async fn post_server_transfer(
     server.set_transfer_task(Some(handle.abort_handle())).await;
 
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+/// wings `Transfer.SendMessage`: a colored console line on the
+/// `transfer logs` event, gated by admin.websocket.transfer.
+pub fn transfer_log(server: &crate::server::Server, message: &str) {
+    let now = chrono::Local::now().format("%a, %d %b %Y %H:%M:%S %Z");
+    server.publish(crate::server::events::ServerEvent::TransferLogs(format!(
+        "\x1b[33m\x1b[1m{now} [Transfer System] [Source Node]:\x1b[0m {message}"
+    )));
 }
 
 /// DELETE /api/servers/:server/transfer — cancel an outgoing transfer.
@@ -336,6 +347,9 @@ async fn push_archive_to_target(
     token: &str,
 ) -> AppResult<()> {
     use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    transfer_log(server, "Preparing to stream server data to destination...");
 
     let root = server.fs.root().to_path_buf();
     let daemon = server.daemon.read().await.clone();
@@ -398,18 +412,43 @@ async fn push_archive_to_target(
 
     // 2. Stream it to the destination (wings: Authorization header is the
     // raw token string provided by the panel, e.g. "Bearer ...").
+    transfer_log(server, "Streaming archive to destination...");
+
+    // Upload progress on the websocket every 5 seconds (wings uses a
+    // ticker + progress bar with width 25). The ticker is aborted as soon
+    // as the upload finishes.
+    let sent = Arc::new(AtomicU64::new(0));
+    let progress_task = {
+        let sent = sent.clone();
+        let progress_server = server.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let n = sent.load(Ordering::SeqCst);
+                transfer_log(&progress_server, &format!("Uploading {}", progress_bar(n, size, 25)));
+            }
+        })
+    };
+
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(&archive_path).await.map_err(|e| {
         AppError::Internal(anyhow::anyhow!("cannot open archive: {e}"))
     })?;
-    let stream = futures_util::stream::try_unfold(file, |mut f| async move {
-        let mut buf = vec![0u8; 65536];
-        let n = f.read(&mut buf).await.map_err(std::io::Error::from)?;
-        if n == 0 {
-            Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
-        } else {
-            buf.truncate(n);
-            Ok(Some((bytes::Bytes::from(buf), f)))
+    let stream = futures_util::stream::try_unfold(file, move |mut f| {
+        let sent_stream = sent.clone();
+        async move {
+            let mut buf = vec![0u8; 65536];
+            let n = f.read(&mut buf).await.map_err(std::io::Error::from)?;
+            if n == 0 {
+                Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
+            } else {
+                buf.truncate(n);
+                sent_stream.fetch_add(n as u64, Ordering::SeqCst);
+                Ok(Some((bytes::Bytes::from(buf), f)))
+            }
         }
     });
     let part = reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream))
@@ -432,6 +471,7 @@ async fn push_archive_to_target(
         .send()
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot reach destination: {e}")))?;
+    progress_task.abort();
     if !resp.status().is_success() {
         return Err(AppError::Internal(anyhow::anyhow!(
             "unexpected status code from destination: {}",
@@ -439,7 +479,24 @@ async fn push_archive_to_target(
         )));
     }
 
+    transfer_log(server, "Finished streaming archive to destination.");
     Ok(())
+}
+
+/// wings internal/progress rendering: `[====>    ] 42.3%` with a bar of
+/// `width` characters.
+fn progress_bar(current: u64, total: u64, width: usize) -> String {
+    let total = total.max(1);
+    let pct = (current as f64 / total as f64 * 100.0).min(100.0);
+    let filled = ((current as f64 / total as f64) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width.saturating_sub(filled);
+    format!(
+        "[{}{}] {:.1}%",
+        "=".repeat(filled),
+        " ".repeat(empty),
+        pct
+    )
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

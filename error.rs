@@ -63,7 +63,10 @@ impl IntoResponse for AppError {
             AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, self.to_string(), false),
             AppError::Unprocessable(_) => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string(), false),
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string(), false),
-            AppError::Docker(_) | AppError::Io(_) | AppError::Internal(_) | AppError::Config(_) | AppError::Remote(_) | AppError::NotImplemented(_) => {
+            // Wings maps its NotImplemented filesystem/backup errors to
+            // 501 with the plain message (router_server_files.go).
+            AppError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, self.to_string(), false),
+            AppError::Docker(_) | AppError::Io(_) | AppError::Internal(_) | AppError::Config(_) | AppError::Remote(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string(), true)
             }
         };

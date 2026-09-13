@@ -59,6 +59,15 @@ tar = "0.4"
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
+xmltree = "0.10"
+bzip2 = "0.5"
+xz2 = "0.1"
+zstd = "0.13"
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+sevenz-rust = { version = "0.6", default-features = false, features = ["compress"] }
+
+# --- Local persistence: activity log (wings uses gorm + SQLite) ---
+rusqlite = { version = "0.32", features = ["bundled"] }
 nix = { version = "0.29", features = ["fs", "hostname", "feature"] }
 base64 = "0.22"
 bytes = "1"

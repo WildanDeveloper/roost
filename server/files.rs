@@ -93,8 +93,9 @@ impl Filesystem {
 
     /// Resolve a file name relative to an already-resolved base directory,
     /// rejecting any `..` component (wings filepath.Join + safePath).
+    /// Leading slashes are treated as root-relative, matching `resolve`.
     fn resolve_under(&self, base: &Path, rel: &str) -> AppResult<PathBuf> {
-        let joined = base.join(rel);
+        let joined = base.join(rel.trim_start_matches('/'));
         let components: Vec<Component> = joined.components().collect();
         if components.iter().any(|c| matches!(c, Component::ParentDir)) {
             return Err(AppError::BadRequest("path escapes the server directory".into()));
@@ -154,8 +155,19 @@ impl Filesystem {
             opts.create_new(true);
         }
         opts.mode(mode.bits());
-        opts.open(p)
-            .map_err(|e| AppError::BadRequest(format!("cannot open {}: {e}", p.display())))
+        opts.open(p).map_err(|e| {
+            // Read opens of a missing file are a 404 (wings
+            // getServerFileContents maps ErrNotExist to 404). Create-mode
+            // opens keep the plain bad-request mapping.
+            if e.kind() == std::io::ErrorKind::NotFound
+                && flags.contains(OFlag::O_RDONLY)
+                && !flags.contains(OFlag::O_CREAT)
+            {
+                AppError::ServerNotFound
+            } else {
+                AppError::BadRequest(format!("cannot open {}: {e}", p.display()))
+            }
+        })
     }
 
     fn is_denied(&self, path: &str) -> bool {
@@ -425,20 +437,28 @@ pub fn rel(&self, abs: &Path) -> String {
         self.stat(&dest)
     }
 
-    /// Decompress a `.zip`, `.tar.gz`, `.tar` (or plain `.gz`) archive in
-    /// `root` into `root` (wings `DecompressFile`).
+    /// Decompress an archive in `root` into `root` (wings
+    /// `DecompressFile`). Supported: zip, tar, tar.gz, tar.bz2, tar.xz,
+    /// tar.zst, tar.lz4 and the single-file compressions (.gz/.bz2/.xz/
+    /// .zst/.lz4, with tar contents auto-detected) plus .7z. RAR is
+    /// explicitly refused (no dependable pure-Rust decoder).
     pub fn decompress(&self, root: &str, file: &str) -> AppResult<()> {
         let base = self.resolve(root)?;
         self.check_denied(file)?;
         let archive = self.resolve_under(&base, file)?;
         self.assert_contained(&archive)?;
         let lower = file.to_lowercase();
-        if !(lower.ends_with(".zip")
-            || lower.ends_with(".tar.gz")
-            || lower.ends_with(".tgz")
-            || lower.ends_with(".tar")
-            || lower.ends_with(".gz"))
-        {
+        const SUPPORTED: [&str; 17] = [
+            ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz",
+            ".tar.zst", ".tzst", ".tar.lz4", ".gz", ".bz2", ".xz", ".zst", ".lz4",
+        ];
+        if lower.ends_with(".rar") || lower.ends_with(".7z") {
+            if lower.ends_with(".rar") {
+                return Err(AppError::BadRequest(
+                    "filesystem: rar archives are not supported".into(),
+                ));
+            }
+        } else if !SUPPORTED.iter().any(|ext| lower.ends_with(ext)) {
             return Err(AppError::BadRequest(
                 "filesystem: unknown archive format".into(),
             ));
@@ -466,9 +486,16 @@ pub fn rel(&self, abs: &Path) -> String {
     /// Used disk space of the server data directory, computed with `du`
     /// semantics: a non-recursive walk that does not follow symlinks
     /// (wings `DirectorySize` — filepath.Walk uses Lstat, so symlinks are
-    /// counted by their own size, never traversed).
+    /// counted by their own size, never traversed). Hardlinks (nlink > 1)
+    /// are counted only once per inode, matching wings' inode-based
+    /// dedupe — without this, a user could inflate usage reports (or
+    /// dodge the disk limiter) by hardlinking a large file many times.
     pub fn disk_usage(&self) -> u64 {
+        use std::collections::HashSet;
+        use std::os::unix::fs::MetadataExt;
+
         let mut total: u64 = 0;
+        let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
             let entries = match fs::read_dir(&dir) {
@@ -482,9 +509,15 @@ pub fn rel(&self, abs: &Path) -> String {
                 };
                 if meta.is_dir() {
                     stack.push(entry.path());
-                } else {
-                    total += meta.len();
+                    continue;
                 }
+                if meta.nlink() > 1 {
+                    let key = (meta.dev(), meta.ino());
+                    if !seen_inodes.insert(key) {
+                        continue;
+                    }
+                }
+                total += meta.len();
             }
         }
         total
@@ -647,7 +680,7 @@ mod uuids {
         use std::path::Path;
 
     pub fn archive(root: &Path, dir: &str, files: &[String]) -> std::io::Result<std::path::PathBuf> {
-        let base = root.join(dir);
+        let base = root.join(dir.trim_start_matches('/'));
         let archive_name = format!("archive-{}.tar.gz", uuid::Uuid::new_v4());
         let dest = base.join(&archive_name);
         // Create the base directory if needed, so the archive lands in it.
@@ -659,8 +692,9 @@ mod uuids {
             .write(file, flate2::Compression::default());
         let mut tar = tar::Builder::new(gz);
         for f in files {
-            let src = base.join(f);
-            let rel = Path::new(f);
+            let name = f.trim_start_matches('/');
+            let src = base.join(name);
+            let rel = Path::new(name);
             if src.is_dir() {
                 tar.append_dir_all(rel, &src)?;
             } else {

@@ -91,15 +91,74 @@ chmod +x target/release/roost
 ROOST_CONFIG=/etc/pterodactyl/config.yml ./target/release/roost
 ```
 
+### CLI subcommands
+
+Besides running the daemon, the binary ships the same helper subcommands as
+wings:
+
+```bash
+# Fetch the node configuration from the panel and write config.yml
+# (wings `configure`).
+roost configure --panel-url https://panel.example.com --token <apikey> \
+    --node 1 [--config-path /etc/pterodactyl/config.yml] \
+    [--override] [--allow-insecure]
+
+# Collect a debugging report (versions, sanitized config, docker info,
+# managed containers, latest logs — never tokens) (wings `diagnostics`).
+roost diagnostics [--config-path PATH] [--log-lines N] [--output FILE]
+    [--include-endpoints] [--no-logs]
+
+roost version
+```
+
+## Tests
+
+Unit tests (egg parser semantics, gitignore, activity store, payload
+shapes):
+
+```bash
+cargo test
+```
+
+Conformance suite: spins up a mock panel implementing the Wings
+`/api/remote/*` surface, launches the daemon against it, and drives the
+full HTTP + WebSocket + SFTP API end-to-end (including a real container
+start/command/stop cycle, backups, transfers, JWT flows and real SSH/SFTP
+sessions via paramiko):
+
+```bash
+cargo build && python3 tests/conformance.py
+```
+
+Against a live panel instead of the mock:
+
+```bash
+PANEL_URL=https://panel.example.com PANEL_TOKEN=<apikey> NODE_ID=1 \
+DAEMON_URL=http://127.0.0.1:8080 DAEMON_TOKEN=<daemon-token> \
+    python3 tests/conformance.py
+```
+
 ## Status / Roadmap
 
 - [x] API skeleton, auth, system routes
 - [x] Server lifecycle (install, start, stop, restart, kill, suspend)
 - [x] Console websocket + event streams
 - [x] File manager + remote downloads + backups
-- [ ] SFTP server (config present, not implemented yet)
-- [ ] Crash detection tuning and edge cases
-- [ ] Full integration testing against a live panel
+- [x] SFTP server (russh, panel-delegated auth, permission checks)
+- [x] Crash detection (OOM, clean-exit policy, restart cooldown)
+- [x] Egg configuration file rewriting (`file`/`yaml`/`json`/`ini`/`xml`/
+      `properties` parsers with `{{ config.* }}` templating — wings parser port)
+- [x] Startup "done" line detection (`regex:` matchers, strip_ansi) and
+      stop-command echo handling
+- [x] Server state persistence (`states.json`) with re-attach/boot restore
+- [x] Installer exit-code checking (improvement over wings: non-zero
+      script exit fails the install)
+- [x] Hardlink-aware disk usage accounting (improvement over wings)
+- [x] Activity log persistence (SQLite, wings activityCron + sftpCron merge)
+- [x] CLI `configure` + `diagnostics` subcommands
+- [x] Conformance suite (`tests/conformance.py`) exercising the full HTTP +
+      WebSocket + SFTP surface against a mock or live panel
+- [ ] Battle-tested production track record (CVE history, audits)
 
 ## License
 

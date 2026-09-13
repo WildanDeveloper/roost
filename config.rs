@@ -311,7 +311,7 @@ pub struct RemoteQueryConfig {
 }
 
 impl Config {
-    const DEFAULTS: &'static str = include_str!("config.example.yml");
+    pub(crate) const DEFAULTS: &'static str = include_str!("config.example.yml");
 
     /// Load `config.yml` from disk. If the file is missing, load the
     /// bundled example so defaults are sensible.
@@ -336,7 +336,7 @@ impl Config {
     /// Wings supports `token: $ENV_VAR` or `token: file:///path/to/secret`
     /// indirection, plus env overrides `WINGS_TOKEN` / `WINGS_TOKEN_ID`.
     /// We mirror that behavior.
-    fn resolve_token(&mut self) {
+    pub(crate) fn resolve_token(&mut self) {
         self.token = expand_value(&self.token);
         self.token_id = expand_value(&self.token_id);
 
@@ -400,6 +400,12 @@ impl Config {
         } else {
             std::path::PathBuf::from(&self.system.backup_directory)
         }
+    }
+
+    /// Location of the cached server-state file used to restore servers
+    /// after a daemon or machine restart (wings `GetStatesPath`).
+    pub fn states_path(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.system.root_directory).join("states.json")
     }
 
     /// Write a logrotate configuration for the daemon log file, mirroring

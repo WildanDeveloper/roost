@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -84,6 +84,11 @@ pub struct Server {
     /// Set before an intentional stop/kill so the exit watcher skips crash
     /// detection (wings sets the ProcessStoppingState first for this).
     pub intentional_stop: AtomicBool,
+    /// Incremented on every container start. Exit watchers capture the
+    /// generation they belong to and ignore events for older generations,
+    /// so a slow exit event from a previous container can never consume
+    /// the new container's intentional_stop flag or clobber its state.
+    start_generation: AtomicU64,
 
     pub docker: DockerClient,
     pub fs: Filesystem,
@@ -99,6 +104,10 @@ pub struct Server {
     /// Latest computed resource usage.
     usage: RwLock<ResourceUsage>,
     started_at: Mutex<Option<Instant>>,
+    /// Wall-clock uptime offset in ms. Set when re-attaching to a container
+    /// that was already running (boot restore), so reported uptime matches
+    /// the container's real StartedAt instead of the attach moment.
+    uptime_offset_ms: std::sync::atomic::AtomicU64,
 
     /// Serializes power actions for this server.
     power_lock: Mutex<()>,
@@ -147,6 +156,17 @@ impl Server {
             .map(|c| c.system.websocket_log_count)
             .unwrap_or(150);
 
+        // Ensure the volume directory exists before any filesystem route
+        // touches it (wings panel provisioners create it ahead of boot).
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            tracing::warn!(
+                uuid = %data.uuid,
+                path = %data_dir.display(),
+                error = %e,
+                "cannot create server data directory"
+            );
+        }
+
         Self {
             uuid: data.uuid,
             name: RwLock::new(data.settings.meta.name.clone()),
@@ -157,6 +177,7 @@ impl Server {
             installing: AtomicBool::new(false),
             restoring: AtomicBool::new(false),
             intentional_stop: AtomicBool::new(false),
+            start_generation: AtomicU64::new(0),
             docker: shared.docker.clone(),
             fs: Filesystem::new(data_dir, denylist),
             daemon: shared.daemon.clone(),
@@ -166,6 +187,7 @@ impl Server {
             log_count,
             usage: RwLock::new(ResourceUsage::offline()),
             started_at: Mutex::new(None),
+            uptime_offset_ms: std::sync::atomic::AtomicU64::new(0),
             power_lock: Mutex::new(()),
             throttle: Mutex::new(ThrottleState::default()),
             console_tx: RwLock::new(None),
@@ -257,7 +279,45 @@ impl Server {
                 }
                 logs.push_back(line.clone());
             }
-            self.publish(ServerEvent::ConsoleOutput(line));
+            self.publish(ServerEvent::ConsoleOutput(line.clone()));
+            // wings onConsoleOutput: a "done" line flips Starting to
+            // Running; the echoed stop command flips Running to Offline so
+            // a user-initiated console stop is never treated as a crash.
+            self.check_console_state_transition(&line).await;
+        }
+    }
+
+    /// wings `onConsoleOutput` state detection, run for every throttled-in
+    /// console line.
+    async fn check_console_state_transition(&self, line: &str) {
+        let state = self.query_state().await;
+        let process = self.process_config.read().await;
+
+        if state == ServerState::Starting {
+            let check_line = if process.startup.strip_ansi {
+                strip_ansi(line)
+            } else {
+                line.to_string()
+            };
+            let matched = process.startup.done.iter().find(|m| m.matches(&check_line));
+            if let Some(matcher) = matched {
+                let pattern = matcher.as_str().to_string();
+                drop(process);
+                tracing::info!(uuid = %self.uuid, match = %pattern, "detected server in running state based on console line output");
+                self.set_state(ServerState::Running).await;
+            }
+            return;
+        }
+
+        if state == ServerState::Running {
+            let stop = process.stop.clone();
+            if stop.r#type == "command" && !stop.value.is_empty() && line == stop.value {
+                drop(process);
+                // The user stopped the process via a console command; mark
+                // offline now so the exit is never treated as a crash.
+                tracing::info!(uuid = %self.uuid, "detected stop command in console output");
+                self.set_state(ServerState::Offline).await;
+            }
         }
     }
 
@@ -392,7 +452,8 @@ pub async fn disk_bytes(&self) -> u64 {
             .lock()
             .await
             .map(|t| t.elapsed().as_millis() as u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            + self.uptime_offset_ms.load(Ordering::SeqCst);
 
         // wings calculateDockerMemory: subtract cached/inactive pages so the
         // panel shows the same numbers the docker CLI does.
@@ -690,6 +751,10 @@ pub async fn disk_bytes(&self) -> u64 {
         if self.is_running() {
             return Ok(());
         }
+        // Bump the generation for this boot; any exit watcher still draining
+        // a previous container now carries a stale generation and will
+        // ignore its events.
+        self.start_generation.fetch_add(1, Ordering::SeqCst);
         self.set_state(ServerState::Starting).await;
 
         // onBeforeStart: sync configuration from panel.
@@ -714,6 +779,10 @@ pub async fn disk_bytes(&self) -> u64 {
                 "Cannot start server, server has run out of disk space.".into(),
             ));
         }
+
+        // onBeforeStart: rewrite the egg's configuration files with the
+        // freshly synced panel data (wings UpdateConfigurationFiles).
+        self.update_configuration_files().await;
 
         std::fs::create_dir_all(self.fs.root())
             .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create data dir: {e}")))?;
@@ -765,6 +834,7 @@ pub async fn disk_bytes(&self) -> u64 {
             return Err(e);
         }
         *self.started_at.lock().await = Some(Instant::now());
+        self.uptime_offset_ms.store(0, Ordering::SeqCst);
         self.set_state(ServerState::Running).await;
         // Apply resource limits in-place after boot (wings InSituUpdate).
         if let Err(e) = self.apply_limits().await {
@@ -772,6 +842,7 @@ pub async fn disk_bytes(&self) -> u64 {
         }
         self.start_stats_loop();
         let name = self.uuid.to_string();
+        let generation = self.start_generation.load(Ordering::SeqCst);
         let watcher = self.clone();
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -785,6 +856,13 @@ pub async fn disk_bytes(&self) -> u64 {
                 }
             }
             drop(wait);
+            // Stale watcher: this exit belongs to a container from an older
+            // generation (the server was restarted in the meantime). Do not
+            // touch state or the intentional_stop flag of the new run.
+            if watcher.start_generation.load(Ordering::SeqCst) != generation {
+                tracing::debug!(uuid = %name, "ignoring exit event from previous container generation");
+                return;
+            }
             watcher.set_state(ServerState::Offline).await;
             watcher.stats_running.store(false, Ordering::SeqCst);
             // Intentional stops mark the Stopping state first (wings); only
@@ -889,6 +967,33 @@ pub async fn disk_bytes(&self) -> u64 {
     /// Push a daemon-originated console line (crash notices, etc).
     pub async fn publish_daemon_message(&self, msg: String) {
         self.publish(ServerEvent::DaemonMessage(msg));
+    }
+
+    /// Set `started_at` from the container's actual StartedAt when
+    /// re-attaching to a container that survived a daemon restart, so
+    /// reported uptime keeps counting from the real boot time.
+    pub async fn mark_started_from_container(&self, name: &str) {
+        let started_at = self
+            .docker
+            .inspect_container(name)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|c| c.state)
+            .and_then(|s| s.started_at);
+        let Some(started_at) = started_at else {
+            return;
+        };
+        let offset_ms = chrono::DateTime::parse_from_rfc3339(&started_at)
+            .ok()
+            .and_then(|t| {
+                let elapsed = chrono::Utc::now().signed_duration_since(t);
+                u64::try_from(elapsed.num_milliseconds()).ok()
+            })
+            .unwrap_or(0);
+        self.uptime_offset_ms
+            .store(offset_ms, Ordering::SeqCst);
+        *self.started_at.lock().await = Some(Instant::now());
     }
 
     pub async fn power_start(self: &Arc<Self>) -> AppResult<()> {
@@ -1043,6 +1148,17 @@ pub async fn disk_bytes(&self) -> u64 {
 pub fn ensure_dir(path: &Path) -> AppResult<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot create {}: {e}", path.display())))
+}
+
+/// wings `stripAnsiRegex`: remove ANSI/VT escape sequences from a line
+/// before matching startup "done" patterns (opt-in via egg strip_ansi).
+fn strip_ansi(line: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new("[\u{1b}\u{9b}][\\[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u{7})|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))")
+            .expect("valid ansi regex")
+    });
+    re.replace_all(line, "").into_owned()
 }
 
 /// Recursively chown a directory tree. Symlinks are chowned as links and

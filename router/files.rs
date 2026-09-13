@@ -111,6 +111,11 @@ async fn rename_files(
     server: ServerExtractor,
     Json(payload): Json<RenameRequest>,
 ) -> AppResult<Response> {
+    if payload.files.is_empty() {
+        return Err(AppError::Unprocessable(
+            "No files to move or rename were provided.".into(),
+        ));
+    }
     let pairs: Vec<(String, String)> = payload
         .files
         .into_iter()
@@ -172,6 +177,11 @@ async fn delete_files(
     server: ServerExtractor,
     Json(payload): Json<FilesRequest>,
 ) -> AppResult<Response> {
+    if payload.files.is_empty() {
+        return Err(AppError::Unprocessable(
+            "No files were specified for deletion.".into(),
+        ));
+    }
     server.fs.delete(&payload.root, &payload.files)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -180,6 +190,11 @@ async fn compress(
     server: ServerExtractor,
     Json(payload): Json<FilesRequest>,
 ) -> AppResult<JsonValue> {
+    if payload.files.is_empty() {
+        return Err(AppError::Unprocessable(
+            "No files were passed through to be compressed.".into(),
+        ));
+    }
     let stat = server.fs.compress(&payload.root, &payload.files)?;
     Ok(JsonValue(json!(stat)))
 }
@@ -214,6 +229,11 @@ async fn chmod(
     server: ServerExtractor,
     Json(payload): Json<ChmodRequest>,
 ) -> AppResult<Response> {
+    if payload.files.is_empty() {
+        return Err(AppError::Unprocessable(
+            "No files to chmod were provided.".into(),
+        ));
+    }
     let pairs: Vec<(String, u32)> = payload
         .files
         .into_iter()

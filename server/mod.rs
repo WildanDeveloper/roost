@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod config_parser;
 pub mod console;
 pub mod events;
 pub mod files;

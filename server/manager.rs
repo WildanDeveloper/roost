@@ -79,6 +79,7 @@ impl ServerManager {
         tracing::info!(count = known.len(), "servers registered from panel");
 
         self.cleanup_orphaned_containers(&known).await;
+        self.restore_states().await;
         Ok(())
     }
 
@@ -181,6 +182,135 @@ pub async fn set_suspended(&self, uuid: Uuid, suspended: bool) -> AppResult<()> 
         let server = self.get(uuid).await?;
         server.suspended.store(suspended, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Write the current state of every server to `states.json` so a
+    /// daemon or machine restart can restore servers to their previous
+    /// state (wings `Manager.PersistStates`). Runs on a 60s ticker; the
+    /// file is allowed to lag behind reality.
+    pub async fn persist_states(&self) -> AppResult<()> {
+        let path = {
+            let daemon = self.shared.daemon.read().await;
+            daemon.states_path()
+        };
+        let mut states = serde_json::Map::new();
+        for server in self.list().await {
+            states.insert(
+                server.uuid.to_string(),
+                serde_json::Value::String(server.query_state().await.as_str().to_string()),
+            );
+        }
+        let data = serde_json::to_vec(&states)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot serialize states: {e}")))?;
+        std::fs::write(&path, data)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot write {}: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// Read the cached states from disk, keeping only servers that are
+    /// currently registered (wings `Manager.ReadStates`).
+    fn read_states(&self) -> HashMap<Uuid, String> {
+        let path = {
+            match self.shared.daemon.try_read() {
+                Ok(daemon) => daemon.states_path(),
+                Err(_) => return HashMap::new(),
+            }
+        };
+        let raw = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(_) => return HashMap::new(),
+        };
+        let parsed: HashMap<String, String> = match serde_json::from_slice(&raw) {
+            Ok(m) => m,
+            Err(_) => return HashMap::new(),
+        };
+        parsed
+            .into_iter()
+            .filter_map(|(k, v)| k.parse::<Uuid>().ok().map(|u| (u, v)))
+            .collect()
+    }
+
+    /// Restore servers to their pre-restart state after a daemon boot
+    /// (wings cmd/root.go): servers whose container is still running get
+    /// re-attached (never stopped externally!), servers that were
+    /// running/starting before the restart are booted again, everything
+    /// else is forced offline. Up to 4 servers are processed concurrently
+    /// with a 30s Docker timeout each (wings workerpool of 4).
+    pub async fn restore_states(&self) {
+        let states = self.read_states();
+        if states.is_empty() {
+            return;
+        }
+        tracing::info!(count = states.len(), "restoring cached server states");
+
+        let mut futures = Vec::new();
+        for (uuid, state) in states {
+            let server = match self.get(uuid).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            futures.push(Self::restore_one(server, state));
+        }
+
+        use futures_util::StreamExt;
+        let _ = futures_util::stream::iter(futures)
+            .buffer_unordered(4)
+            .collect::<Vec<()>>()
+            .await;
+
+        // Refresh the cache immediately so a crash right after boot does
+        // not resurrect stale states.
+        if let Err(e) = self.persist_states().await {
+            tracing::warn!(error = %e, "failed to persist server states after restore");
+        }
+    }
+
+    async fn restore_one(server: Arc<Server>, state: String) {
+        let name = server.uuid.to_string();
+
+        // Is the container actually running right now? Bounded to 30s so
+        // a hung Docker daemon cannot block the whole boot (wings uses a
+        // 30s context for exactly this reason).
+        let container_running = {
+            let docker = server.docker.clone();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                async { docker.inspect_container(&name).await.ok().flatten() },
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.state.and_then(|s| s.running).unwrap_or(false))
+            .unwrap_or(false)
+        };
+
+        if container_running {
+            // Never stop a container that is running outside our control —
+            // re-attach instead (wings keeps those processes alive).
+            tracing::info!(uuid = %name, "detected server is running, re-attaching to process...");
+            if let Ok(stream) = server.docker.attach(&name).await {
+                crate::server::console::start_console(server.clone(), stream).await;
+            }
+            server.set_state(crate::server::ServerState::Running).await;
+            server.mark_started_from_container(&name).await;
+            server.start_stats_loop();
+            if let Err(e) = server.sync_from_panel().await {
+                tracing::warn!(uuid = %name, error = %e, "failed to re-sync server configuration");
+            }
+            return;
+        }
+
+        match state.as_str() {
+            "running" | "starting" => {
+                tracing::info!(uuid = %name, previous = %state, "returning server to running state");
+                if let Err(e) = server.power_start().await {
+                    tracing::warn!(uuid = %name, error = %e, "failed to return server to running state");
+                }
+            }
+            _ => {
+                server.set_state(crate::server::ServerState::Offline).await;
+            }
+        }
     }
 
     #[allow(dead_code)]

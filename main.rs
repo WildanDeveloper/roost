@@ -1,9 +1,11 @@
 mod auth;
+mod cli;
 mod config;
 mod docker;
 mod error;
 mod jwt;
 mod models;
+mod parser;
 mod remote;
 mod router;
 mod server;
@@ -27,8 +29,31 @@ use server::activity::ActivityCollector;
 use server::ServerManager;
 use state::{DaemonState, SharedConfig};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = argv.first() {
+        // Subcommands run before any tokio runtime exists; they exit on
+        // their own. Only the bare daemon falls through.
+        if first == "configure" || first == "diagnostics" || first == "--version" || first == "version" {
+            return std::process::ExitCode::from(cli::run(&argv) as u8);
+        }
+    }
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => match rt.block_on(run_daemon()) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("roost: {e:#}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            eprintln!("roost: cannot start async runtime: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_daemon() -> anyhow::Result<()> {
     let config_path = std::env::var("ROOST_CONFIG").unwrap_or_else(|_| "/etc/pterodactyl/config.yml".into());
     let config = Config::load(&config_path)?;
     config.ensure_directories()?;
@@ -77,10 +102,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let tokens = Arc::new(TokenStore::with_ttl(Duration::from_secs(3600)));
-    let manager = Arc::new(ServerManager::new(docker, shared.clone(), panel.clone()));
-    manager.boot().await?;
-
+    // The crash-restart channel must exist before boot: boot restores
+    // servers to their previous running state, and a container that dies
+    // during that window already goes through crash detection.
     let (crash_tx, mut crash_rx) = tokio::sync::mpsc::unbounded_channel::<Arc<server::Server>>();
     let _ = server::CRASH_RESTART_TX.set(crash_tx);
     tokio::spawn(async move {
@@ -91,7 +115,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let activity = Arc::new(ActivityCollector::new());
+    let tokens = Arc::new(TokenStore::with_ttl(Duration::from_secs(3600)));
+    let manager = Arc::new(ServerManager::new(docker, shared.clone(), panel.clone()));
+    manager.boot().await?;
+
+    // Wings persists server states once a minute so an unexpected reboot
+    // can restore servers to their previous state (cmd/root.go).
+    {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = manager.persist_states().await {
+                    tracing::warn!(error = %e, "failed to persist server states to disk");
+                }
+            }
+        });
+    }
+
+    let activity = Arc::new(ActivityCollector::new(
+        &shared.read().await.states_path().with_file_name("activity.sqlite"),
+    ).map_err(|e| anyhow::anyhow!("cannot open activity database: {e}"))?);
     {
         let cfg = shared.read().await;
         let interval = std::time::Duration::from_secs(cfg.system.activity_send_interval.max(1));
@@ -144,7 +189,11 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     } else {
         tracing::info!("roost API listening on http://{addr}");
-        axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+        axum::serve(
+            tokio::net::TcpListener::bind(addr).await?,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
     }
 
     Ok(())

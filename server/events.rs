@@ -26,6 +26,9 @@ pub enum ServerEvent {
     Deleted,
     /// "started" | "success" | "failure" (wings transfer status event).
     TransferStatus(String),
+    /// One transfer console line (wings TransferLogsEvent, gated by
+    /// admin.websocket.transfer).
+    TransferLogs(String),
 }
 
 impl ServerEvent {
@@ -41,8 +44,9 @@ impl ServerEvent {
             ServerEvent::DaemonMessage(_) => "daemon message",
             ServerEvent::BackupCompleted(_) => "backup completed",
             ServerEvent::BackupRestoreCompleted(_) => "backup restore completed",
-            ServerEvent::Deleted => "server deleted",
+            ServerEvent::Deleted => "deleted",
             ServerEvent::TransferStatus(_) => "transfer status",
+            ServerEvent::TransferLogs(_) => "transfer logs",
         }
     }
 
@@ -57,8 +61,10 @@ impl ServerEvent {
             ServerEvent::InstallStarted | ServerEvent::InstallCompleted => vec![String::new()],
             ServerEvent::DaemonMessage(msg) => vec![msg.clone()],
             ServerEvent::BackupCompleted(payload) | ServerEvent::BackupRestoreCompleted(payload) => vec![payload.clone()],
-            ServerEvent::Deleted => vec![String::new()],
+            // wings publishes DeletedEvent with nil data -> json "null".
+            ServerEvent::Deleted => vec!["null".to_string()],
             ServerEvent::TransferStatus(state) => vec![state.clone()],
+            ServerEvent::TransferLogs(line) => vec![line.clone()],
         }
     }
 
@@ -70,6 +76,7 @@ impl ServerEvent {
                 Some("admin.websocket.install")
             }
             ServerEvent::BackupCompleted(_) | ServerEvent::BackupRestoreCompleted(_) => Some("backup.read"),
+            ServerEvent::TransferLogs(_) => Some("admin.websocket.transfer"),
             _ => None,
         }
     }

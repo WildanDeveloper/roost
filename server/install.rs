@@ -33,8 +33,8 @@ impl Drop for InstallerCleanup {
 impl Server {
     /// Run the egg install script for this server. Stops the server first,
     /// runs the `<uuid>_installer` container, then reports the outcome to
-    /// the panel. Mirrors wings: completion is "container stopped" — the
-    /// exit code is not inspected.
+    /// the panel. Improvement over wings: a non-zero script exit code is
+    /// treated as a failed install instead of silently succeeding.
     pub async fn install(self: &Arc<Self>, reinstall: bool) {
         if self.installing.swap(true, Ordering::SeqCst) {
             tracing::warn!(uuid = %self.uuid, "install already in progress");
@@ -201,7 +201,9 @@ impl Server {
             });
         }
 
-        // 7. Start and wait for the container to stop.
+        // 7. Start and wait for the container to stop. Unlike wings, roost
+        // inspects the exit code: a non-zero exit means the install script
+        // failed, which is reported to the panel as such.
         tracing::info!(uuid = %self.uuid, "starting installer container");
         self.docker.start(&installer_name).await?;
         tracing::info!(uuid = %self.uuid, "installer container started; waiting for exit");
@@ -221,16 +223,33 @@ impl Server {
             .await;
         }
 
-        {
+        let exit_code = {
             use futures_util::StreamExt;
             let mut wait = self.docker.wait_until_stopped(&installer_name);
-            let _ = wait.next().await;
-        }
+            let mut code = 0;
+            while let Some(item) = wait.next().await {
+                if let Ok(ev) = item {
+                    code = ev.status_code;
+                    break;
+                }
+            }
+            code
+        };
 
         // 8. Cleanup.
-        tracing::info!(uuid = %self.uuid, "installer container finished; cleaning up");
+        tracing::info!(uuid = %self.uuid, code = exit_code, "installer container finished; cleaning up");
         self.docker.remove(&installer_name).await?;
         let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        if exit_code != 0 {
+            self.publish(ServerEvent::DaemonMessage(format!(
+                "Installation script exited with code {exit_code}."
+            )));
+            return Err(AppError::BadRequest(format!(
+                "install script for {uuid} exited with code {exit_code}",
+                uuid = self.uuid
+            )));
+        }
 
         Ok(())
     }

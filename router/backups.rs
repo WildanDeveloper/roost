@@ -65,6 +65,15 @@ async fn create_backup(
 async fn run_backup(server: Arc<crate::server::Server>, backup_uuid: Uuid, ignore: String) {
     server.publish(ServerEvent::DaemonMessage("Preparing backup...".to_string()));
 
+    // Wings server.Backup: when the panel does not pass ignore patterns,
+    // fall back to the server-wide `.pteroignore` file in the data
+    // directory (symlinks and files over 32KiB are ignored).
+    let ignore = if ignore.is_empty() {
+        read_serverwide_ignore(&server).unwrap_or_else(|| ignore)
+    } else {
+        ignore
+    };
+
     let daemon = server.daemon.read().await.clone();
     let backup_dir = daemon.backup_dir();
     if let Err(e) = std::fs::create_dir_all(&backup_dir) {
@@ -266,6 +275,13 @@ async fn run_s3_backup(server: Arc<crate::server::Server>, backup_uuid: Uuid, ig
 
     server.publish(ServerEvent::DaemonMessage("Preparing backup...".to_string()));
 
+    // Same server-wide ignore fallback as the local adapter.
+    let ignore = if ignore.is_empty() {
+        read_serverwide_ignore(&server).unwrap_or_else(|| ignore)
+    } else {
+        ignore
+    };
+
     let daemon = server.daemon.read().await.clone();
     let backup_dir = daemon.backup_dir();
     if let Err(e) = std::fs::create_dir_all(&backup_dir) {
@@ -457,6 +473,20 @@ async fn run_s3_backup(server: Arc<crate::server::Server>, backup_uuid: Uuid, ig
     server.publish(ServerEvent::BackupCompleted(payload.to_string()));
 }
 
+/// wings getServerwideIgnoredFiles: read `.pteroignore` from the data
+/// directory root. Refuses symlinked files and anything over 32KiB.
+fn read_serverwide_ignore(server: &crate::server::Server) -> Option<String> {
+    let p = server.fs.root().join(".pteroignore");
+    let meta = match std::fs::symlink_metadata(&p) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    if meta.is_symlink() || meta.len() > 32 * 1024 {
+        return None;
+    }
+    std::fs::read_to_string(&p).ok()
+}
+
 fn backup_failed_json(uuid: Uuid) -> String {
     serde_json::json!({
         "uuid": uuid,
@@ -481,7 +511,7 @@ struct RestoreRequest {
 /// POST /api/servers/:id/backup/:backup/restore
 async fn restore_backup(
     server: ServerExtractor,
-    Path(backup_uuid): Path<Uuid>,
+    Path((_server_uuid, backup_uuid)): Path<(String, Uuid)>,
     Json(payload): Json<RestoreRequest>,
 ) -> AppResult<Response> {
     match payload.adapter.as_str() {
@@ -853,7 +883,7 @@ async fn run_restore(server: Arc<crate::server::Server>, backup_uuid: Uuid, trun
 /// DELETE /api/servers/:id/backup/:backup — delete the local archive.
 async fn delete_backup(
     server: ServerExtractor,
-    Path(backup_uuid): Path<Uuid>,
+    Path((_server_uuid, backup_uuid)): Path<(String, Uuid)>,
 ) -> AppResult<Response> {
     let daemon = server.daemon.read().await.clone();
     let archive = daemon.backup_dir().join(format!("{backup_uuid}.tar.gz"));

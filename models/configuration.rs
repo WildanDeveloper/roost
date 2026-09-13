@@ -107,13 +107,88 @@ pub struct ProcessConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessStartup {
-    /// Lines that match these mark the server as "started".
-    #[serde(default)]
-    pub done: Vec<String>,
+    /// Lines that match these mark the server as "started". Each entry is
+    /// either a raw substring or `regex:...` (wings OutputLineMatcher).
+    /// Accepts a bare string as well as a list (some egg exports use a
+    /// single string where wings expects `[]*OutputLineMatcher`).
+    #[serde(default, deserialize_with = "de_one_or_many")]
+    pub done: Vec<OutputLineMatcher>,
     #[serde(default)]
     pub user_interaction: Vec<String>,
     #[serde(default)]
     pub strip_ansi: bool,
+}
+
+fn de_one_or_many<'de, D>(deserializer: D) -> Result<Vec<OutputLineMatcher>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(OutputLineMatcher),
+        Many(Vec<OutputLineMatcher>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(m) => Ok(vec![m]),
+        OneOrMany::Many(list) => Ok(list),
+    }
+}
+
+/// One startup "done" line matcher (wings `remote.OutputLineMatcher`):
+/// a raw substring, or a compiled regex when the string is prefixed
+/// with `regex:`.
+#[derive(Debug, Clone)]
+pub struct OutputLineMatcher {
+    raw: Option<String>,
+    regex: Option<regex::Regex>,
+}
+
+impl<'de> Deserialize<'de> for OutputLineMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if let Some(pattern) = raw.strip_prefix("regex:") {
+            if pattern.is_empty() {
+                return Ok(Self { raw: Some(raw), regex: None });
+            }
+            match regex::Regex::new(pattern) {
+                Ok(re) => Ok(Self { raw: None, regex: Some(re) }),
+                Err(e) => {
+                    tracing::warn!(raw = %raw, error = %e, "failed to compile output line marked as being regex");
+                    Ok(Self { raw: Some(raw), regex: None })
+                }
+            }
+        } else {
+            Ok(Self { raw: Some(raw), regex: None })
+        }
+    }
+}
+
+impl Serialize for OutputLineMatcher {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl OutputLineMatcher {
+    pub fn as_str(&self) -> &str {
+        self.raw.as_deref().unwrap_or("")
+    }
+
+    /// wings `Matches`: regex match when compiled, otherwise substring
+    /// containment against the (possibly ANSI-stripped) line.
+    pub fn matches(&self, line: &str) -> bool {
+        match &self.regex {
+            Some(re) => re.is_match(line),
+            None => match &self.raw {
+                Some(raw) => line.contains(raw.as_str()),
+                None => false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,20 +199,108 @@ pub struct ProcessStop {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// One egg configuration file entry from
+/// `process_configuration.configs` (panel `ConfigurationFile`):
+/// `{"file": "...", "parser": "...", "replace": [...]}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternConfig {
     pub file: String,
+    /// "file" | "yaml"/"yml" | "properties" | "ini" | "json" | "xml"
+    #[serde(default)]
+    pub parser: String,
     #[serde(default)]
     pub replace: Vec<PatternReplace>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One find/replace rule. `replace_with` is a typed JSON value in the
+/// panel payload (string, bool or number); very old eggs used the key
+/// "value" instead. `if_value` is optional (exact match or `regex:`).
+#[derive(Debug, Clone, Serialize)]
 pub struct PatternReplace {
     #[serde(rename = "match")]
     pub match_: String,
-    pub replace_with: String,
+    pub replace_with: ReplaceValue,
     #[serde(default)]
     pub if_value: String,
+}
+
+/// The typed replacement value (wings `ReplaceValue` over jsonparser).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ReplaceValue {
+    Str(String),
+    Bool(bool),
+    Number(serde_json::Number),
+    Null,
+}
+
+impl ReplaceValue {
+    /// wings `ReplaceValue.String()`: JSON strings are unescaped, null
+    /// renders as "<nil>", booleans/numbers as their raw representation.
+    pub fn as_string(&self) -> String {
+        match self {
+            ReplaceValue::Str(s) => s.clone(),
+            ReplaceValue::Null => "<nil>".to_string(),
+            ReplaceValue::Bool(b) => b.to_string(),
+            ReplaceValue::Number(n) => n.to_string(),
+        }
+    }
+
+    /// Raw string used by the text/file parser (wings `Bytes()`).
+    #[allow(dead_code)]
+    pub fn raw_string(&self) -> String {
+        match self {
+            ReplaceValue::Str(s) => s.clone(),
+            ReplaceValue::Null => "<nil>".to_string(),
+            ReplaceValue::Bool(b) => b.to_string(),
+            ReplaceValue::Number(n) => n.to_string(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PatternReplace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "match")]
+            match_: String,
+            #[serde(default)]
+            if_value: String,
+            #[serde(default)]
+            replace_with: Option<Value>,
+            #[serde(default)]
+            value: Option<Value>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // Old eggs use the "value" key; prefer "replace_with" when present.
+        let replace_with = match (raw.replace_with, raw.value) {
+            (Some(v), _) | (None, Some(v)) => ReplaceValue::from_json(v),
+            (None, None) => ReplaceValue::Null,
+        };
+        Ok(PatternReplace {
+            match_: raw.match_,
+            replace_with,
+            if_value: raw.if_value,
+        })
+    }
+}
+
+impl ReplaceValue {
+    fn from_json(v: Value) -> Self {
+        match v {
+            Value::String(s) => ReplaceValue::Str(s),
+            Value::Bool(b) => ReplaceValue::Bool(b),
+            Value::Number(n) => ReplaceValue::Number(n),
+            Value::Null => ReplaceValue::Null,
+            // Objects/arrays are not valid replacement values; keep the raw
+            // JSON text like wings would for a non-scalar (it treats them
+            // as "<invalid>", but keeping the text is more useful here).
+            other => ReplaceValue::Str(other.to_string()),
+        }
+    }
 }
 
 impl ServerConfig {
@@ -186,4 +349,75 @@ where
             (k, s)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact JSON shape the panel sends in
+    /// `GET /api/remote/servers/{uuid}` (ServerConfigurationStructureService).
+    #[test]
+    fn parses_panel_process_configuration() {
+        let raw = serde_json::json!({
+            "startup": {
+                "done": "Server marked as running...",
+                "user_interaction": ["press ENTER"],
+                "strip_ansi": false
+            },
+            "stop": { "type": "command", "value": "stop" },
+            "configs": [
+                {
+                    "file": "server.properties",
+                    "parser": "properties",
+                    "replace": [
+                        { "match": "server-port", "replace_with": "${SERVER_PORT}" },
+                        { "match": "motd", "replace_with": "A Server", "if_value": "old" },
+                        { "match": "legacy", "value": "old-key-form" },
+                        { "match": "flag", "replace_with": true },
+                        { "match": "count", "replace_with": 3 }
+                    ]
+                },
+                {
+                    "file": "config.yml",
+                    "parser": "yaml",
+                    "replace": [
+                        { "match": "listeners.*.host", "replace_with": "0.0.0.0" },
+                        { "match": "servers[0].address", "replace_with": "{{config.docker.interface}}" }
+                    ]
+                }
+            ]
+        });
+
+        let cfg: ProcessConfig = serde_json::from_value(raw).expect("panel payload must parse");
+        assert_eq!(cfg.startup.done.len(), 1);
+        assert_eq!(cfg.startup.done[0].as_str(), "Server marked as running...");
+        assert_eq!(cfg.stop.r#type, "command");
+
+        assert_eq!(cfg.configs.len(), 2);
+        assert_eq!(cfg.configs[0].parser, "properties");
+        assert_eq!(cfg.configs[0].replace.len(), 5);
+        assert_eq!(cfg.configs[0].replace[0].replace_with, ReplaceValue::Str("${SERVER_PORT}".into()));
+        assert_eq!(cfg.configs[0].replace[1].if_value, "old");
+        // legacy "value" key fallback
+        assert_eq!(cfg.configs[0].replace[2].replace_with, ReplaceValue::Str("old-key-form".into()));
+        assert_eq!(cfg.configs[0].replace[3].replace_with, ReplaceValue::Bool(true));
+        assert_eq!(cfg.configs[0].replace[4].replace_with, ReplaceValue::Number(serde_json::Number::from(3)));
+
+        assert_eq!(cfg.configs[1].parser, "yaml");
+    }
+
+    /// `startup.done` entries prefixed with regex: compile into matchers.
+    #[test]
+    fn done_line_regex_matcher() {
+        let raw = serde_json::json!({
+            "startup": { "done": ["plain line", "regex:^\\[Server thread/INFO\\]: Done \\("], "strip_ansi": true },
+            "stop": { "type": "signal", "value": "SIGTERM" }
+        });
+        let cfg: ProcessConfig = serde_json::from_value(raw).expect("must parse");
+        assert!(cfg.startup.done[0].matches("some log plain line here"));
+        assert!(!cfg.startup.done[0].matches("no match"));
+        assert!(cfg.startup.done[1].matches("[Server thread/INFO]: Done (3.141s)! For help, type \"help\""));
+        assert!(!cfg.startup.done[1].matches("starting up"));
+    }
 }

@@ -10,3 +10,10 @@ target
 *.log
 /config.yml
 /config.yaml
+# daemon runtime artifacts
+/states.json
+/activity.sqlite*
+/backups/
+/archives/
+/data/
+tests/__pycache__/
