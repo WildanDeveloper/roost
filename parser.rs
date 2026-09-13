@@ -605,30 +605,35 @@ fn parse_properties_file(
         }
     }
 
-    // 2. Parse into insertion-ordered key/value pairs.
+    // 2. Parse into insertion-ordered key/value pairs. Multi-line values
+    //    (ending with a single backslash) continue on the next line — the
+    //    continuation chunks are joined before parsing (wings delegates
+    //    this to magiconair/properties; each logical line is parsed once).
     let mut entries: Vec<(String, String)> = Vec::new();
-    let mut pending: Option<(String, String)> = None; // (key, partial value) across line continuations
-    for line in text.lines() {
-        if let Some((key, mut value)) = pending.take() {
-            // Continuation line: if it ends with a single backslash, keep
-            // consuming; otherwise this is the last chunk.
-            let escaped = value.ends_with('\\') && !value.ends_with("\\\\");
-            if escaped {
-                value.pop();
-                pending = Some((key, value));
+    let mut carry_key: Option<String> = None;
+    let mut carry_value: Option<String> = None;
+    for raw_line in text.lines() {
+        if let (Some(key), Some(value)) = (carry_key.take(), carry_value.take()) {
+            // Continuation line: append its content to the pending value.
+            let joined = format!("{value}{}", raw_line.trim());
+            if joined.ends_with('\\') && !joined.ends_with("\\\\") {
+                let mut joined = joined;
+                joined.pop();
+                carry_key = Some(key);
+                carry_value = Some(joined);
                 continue;
             }
-            pending = None;
-            // The final chunk was already appended; fall through.
-            let _ = &mut value;
+            entries.push((key, unescape_properties(&joined)));
+            continue;
         }
-        let trimmed = line.trim_start();
+
+        let trimmed = raw_line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
             continue;
         }
 
         // Find the separator: first unescaped '=', ':' or whitespace.
-        let bytes = line.as_bytes();
+        let bytes = raw_line.as_bytes();
         let mut sep: Option<usize> = None;
         let mut i = 0;
         while i < bytes.len() {
@@ -647,8 +652,8 @@ fn parse_properties_file(
             i += 1;
         }
         let (key_raw, value_raw) = match sep {
-            Some(pos) => (&line[..pos], line[pos..].to_string()),
-            None => (line, String::new()),
+            Some(pos) => (&raw_line[..pos], raw_line[pos..].to_string()),
+            None => (raw_line, String::new()),
         };
         let key = unescape_properties(key_raw.trim());
         // Value: strip the separator char and leading whitespace.
@@ -664,14 +669,15 @@ fn parse_properties_file(
 
         if value.ends_with('\\') && !value.ends_with("\\\\") {
             value.pop();
-            pending = Some((key, value));
+            carry_key = Some(key);
+            carry_value = Some(value);
             continue;
         }
         entries.push((key, value));
     }
     // Flush a dangling continuation (file ended with a backslash).
-    if let Some((key, value)) = pending.take() {
-        entries.push((key, value));
+    if let (Some(key), Some(value)) = (carry_key.take(), carry_value.take()) {
+        entries.push((key, unescape_properties(&value)));
     }
 
     // 3. Apply replacements (wings properties semantics: IfValue compares
@@ -1188,6 +1194,21 @@ mod tests {
         assert!(out.contains("key=hello\\u00a7world"), "out: {out}");
         // motd untouched but re-emitted in insertion order with escaping.
         assert!(out.contains("motd=A \\u00a7B"), "out: {out}");
+    }
+
+    #[test]
+    fn properties_multiline_continuation() {
+        // Multi-line values (backslash continuations) must be joined, not
+        // dropped or re-parsed as new entries (wings magiconair/properties).
+        let out = apply_str(
+            "properties",
+            "# cfg\nmotd=line one \\\n  line two \\\n  line three\nkey=val\n",
+            vec![rule("key", "replaced")],
+        );
+        assert!(out.contains("motd=line one line two line three"), "out: {out}");
+        // The continuation lines must not become duplicate `motd` keys.
+        assert_eq!(out.matches("motd=").count(), 1, "out: {out}");
+        assert!(out.contains("key=replaced"), "out: {out}");
     }
 
     #[test]
