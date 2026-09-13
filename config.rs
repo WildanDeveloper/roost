@@ -206,6 +206,7 @@ pub struct TransfersConfig {
 pub struct DockerConfig {
     pub network: DockerNetworkConfig,
     pub domainname: String,
+    #[serde(deserialize_with = "de_registries")]
     pub registries: Vec<RegistryConfig>,
     pub tmpfs_size: u64,
     pub container_pid_limit: i64,
@@ -519,4 +520,79 @@ fn expand_value(input: &str) -> String {
         return std::env::var(name).unwrap_or_default();
     }
     input
+}
+/// Accept `docker.registries` in both shapes the ecosystem produces:
+/// the wings map (`"<host>": {username, password}`) and the plain
+/// sequence form (`[{name, username, password}]`).
+fn de_registries<'de, D>(deserializer: D) -> Result<Vec<RegistryConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Map(std::collections::HashMap<String, RegistryEntry>),
+        Seq(Vec<RegistryConfig>),
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RegistryEntry {
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        password: String,
+    }
+
+    match Raw::deserialize(deserializer)? {
+        Raw::Seq(list) => Ok(list),
+        Raw::Map(map) => Ok(map
+            .into_iter()
+            .map(|(name, entry)| RegistryConfig {
+                name,
+                username: entry.username,
+                password: entry.password,
+            })
+            .collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registries_accept_wings_map_shape() {
+        let y = r#"
+docker:
+  registries:
+    docker.io:
+      username: u1
+      password: p1
+    ghcr.io:
+      username: u2
+      password: p2
+"#;
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert_eq!(cfg.docker.registries.len(), 2);
+        let dio = cfg
+            .docker
+            .registries
+            .iter()
+            .find(|r| r.name == "docker.io")
+            .unwrap();
+        assert_eq!(dio.username, "u1");
+        assert_eq!(dio.password, "p1");
+    }
+
+    #[test]
+    fn registries_accept_sequence_shape() {
+        let y = "docker:\n  registries: []\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert!(cfg.docker.registries.is_empty());
+
+        let y = "docker:\n  registries:\n    - name: docker.io\n      username: u\n      password: p\n";
+        let cfg: Config = serde_yaml::from_str(y).unwrap();
+        assert_eq!(cfg.docker.registries[0].name, "docker.io");
+        assert_eq!(cfg.docker.registries[0].username, "u");
+    }
 }
