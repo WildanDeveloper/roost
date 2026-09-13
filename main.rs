@@ -34,7 +34,10 @@ fn main() -> std::process::ExitCode {
     if let Some(first) = argv.first() {
         // Subcommands run before any tokio runtime exists; they exit on
         // their own. Only the bare daemon falls through.
-        if first == "configure" || first == "diagnostics" || first == "--version" || first == "version" {
+        if first == "configure" || first == "diagnostics" || first == "version"
+            || first == "--version" || first == "-V"
+            || first == "--help" || first == "-h" || first == "help"
+        {
             return std::process::ExitCode::from(cli::run(&argv) as u8);
         }
     }

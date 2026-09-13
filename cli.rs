@@ -13,20 +13,32 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/pterodactyl/config.yml";
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
-        Some("--version") | Some("version") => {
+        Some("--version") | Some("-V") | Some("version") => {
             println!("roost v{VERSION}");
+            0
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            print_help();
             0
         }
         Some("configure") => configure(&args[1..]),
         Some("diagnostics") => diagnostics(&args[1..]),
         Some(other) => {
             eprintln!(
-                "unknown command `{other}`\n\nusage:\n  roost                    run the daemon\n  roost configure [flags]\n  roost diagnostics [flags]\n  roost version"
+                "unknown command `{other}`\n\n{USAGE}"
             );
             1
         }
         None => 0,
     }
+}
+
+const USAGE: &str = "usage:\n  roost                    run the daemon\n  roost configure [flags]\n  roost diagnostics [flags]\n  roost version";
+
+fn print_help() {
+    println!(
+        "roost — Pterodactyl Wings-compatible daemon written in Rust\n\n{USAGE}"
+    );
 }
 
 struct Flags {
