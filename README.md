@@ -51,24 +51,53 @@ the official daemon — no panel modifications required.
 | Persistence | `states.json` boot restore, activity database survives restarts |
 | Remote downloads | SSRF guard (private/loopback/CGNAT/ULA refused), per-server concurrency cap, disk-limit enforcement |
 
-## Quick start
+## Installation
 
-Requires **Rust 1.75+** (build) and a working **Docker daemon** (runtime).
+### 0. Panel + roost in one shot (recommended)
 
-### One-line install (like the Wings community installer)
+The combined installer installs the Pterodactyl panel **and** roost on the
+same machine, then configures everything automatically: it creates the
+location and the node in the panel, generates
+`/etc/pterodactyl/config.yml` straight from the panel and starts the daemon.
+
+```bash
+sudo bash <(curl -s https://raw.githubusercontent.com/WildanDeveloper/roost/master/pterodactyl-roost-installer.sh)
+```
+
+You will be asked (defaults in brackets):
+
+| Prompt | Default |
+|---|---|
+| Database name | `panel` |
+| Database username | `pterodactyl` |
+| MySQL password | press enter → generated |
+| Timezone | `Asia/Jakarta` |
+| Email (panel + admin account) | — |
+| Admin username / first / last name | `admin` / `Admin` / `User` |
+| Admin password | press enter → generated (shown in `/root/pterodactyl-install-info.txt`) |
+| Panel FQDN (domain or IP) | your public IP |
+| Configure UFW firewall? (y/N) | `n` |
+| Let's Encrypt for the panel? (y/N) | `n` (needs a domain with DNS pointing at this machine) |
+| Assume SSL? (y/N) | `n` |
+| Telemetry | `yes` |
+| Node FQDN | the panel FQDN (Enter) |
+| Let's Encrypt for the node? (y/N) | `n` (reuses the panel certificate automatically) |
+
+When it finishes the node shows **green** in the panel
+(**Admin → Nodes**), and the summary is saved to
+`/root/pterodactyl-install-info.txt`. Everything works exactly like the
+official panel + Wings stack.
+
+### 1. Install roost on an existing panel node (one-line)
+
+Installs Docker (if missing), the release binary, the systemd service and
+walks you through registering the node:
 
 ```bash
 sudo bash <(curl -s https://raw.githubusercontent.com/WildanDeveloper/roost/master/install.sh)
 ```
 
-Downloads the release binary for your architecture, verifies its SHA-256
-checksum, installs Docker if missing, creates the Pterodactyl directory
-layout, installs and enables the `roost` systemd service, then walks you
-through registering the node against your panel. If Wings is already
-installed on the node, the installer stops with instructions — both
-daemons cannot share a machine.
-
-Non-interactive (headless) mode:
+Headless (no prompts):
 
 ```bash
 sudo ROOST_PANEL_URL=https://panel.example.com \
@@ -78,7 +107,14 @@ sudo ROOST_PANEL_URL=https://panel.example.com \
      bash <(curl -s https://raw.githubusercontent.com/WildanDeveloper/roost/master/install.sh)
 ```
 
-### Build from source
+If Wings is already installed on the node, the installer stops with
+instructions — both daemons cannot share a machine (same Docker containers,
+data directories and ports 8080/2022).
+
+### 2. Manual install
+
+Download the binary from [releases](https://github.com/WildanDeveloper/roost/releases/latest)
+(amd64/arm64, SHA-256 verified by the installer) or build from source:
 
 ```bash
 git clone https://github.com/WildanDeveloper/roost.git
@@ -86,20 +122,50 @@ cd roost
 cargo build --release
 ```
 
+Register the node and run:
+
 ```bash
-# register the node from a panel API key (writes /etc/pterodactyl/config.yml)
+# writes /etc/pterodactyl/config.yml from a panel application API key
 sudo ./target/release/roost configure \
     --panel-url https://panel.example.com \
     --token <application-api-key> \
     --node 1
 
-# run the daemon
-sudo ROOST_CONFIG=/etc/pterodactyl/config.yml ./target/release/roost
+# run the daemon (Ctrl+C to stop)
+sudo ./target/release/roost
 ```
 
-Then add the node in the panel as usual (**Admin → Nodes → create**), or point
-an existing node at this machine. SSL termination follows the same
-`api.ssl` block as Wings.
+Then install the systemd service (or copy it from `install.sh`):
+
+```bash
+sudo systemctl enable --now roost
+```
+
+### 3. Domain + SSL on the node
+
+Identical to Wings — the daemon reads the panel-generated `api.ssl` block:
+
+1. Point `node.example.com` (A record) at the node
+2. Obtain a certificate: `sudo certbot certonly --standalone -d node.example.com`
+3. Panel → **Admin → Nodes → edit node** → FQDN `node.example.com`,
+   scheme **HTTPS**
+4. `sudo systemctl restart roost` — the API now serves
+   `https://node.example.com:8080` (API + `wss://` console over the same TLS;
+   SFTP stays on SSH/2022)
+
+The combined installer and `install.sh` do this for you when you answer
+`y` to the Let's Encrypt prompts.
+
+### Managing the service
+
+```bash
+systemctl {start,stop,restart,status} roost
+journalctl -u roost -f          # live logs
+roost diagnostics               # sanitized debugging report (no tokens)
+```
+
+Requires a working **Docker daemon** at runtime; roost refuses to boot
+without one (the systemd unit depends on `docker.service`).
 
 ### CLI
 
