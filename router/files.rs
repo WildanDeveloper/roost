@@ -65,12 +65,14 @@ struct ContentsQuery {
     download: Option<String>,
 }
 
-/// GET /api/servers/:id/files/contents?file=path  (raw bytes)
+/// GET /api/servers/:id/files/contents?file=path  (raw bytes, streamed —
+/// wings streams the body with an io.LimitReader sized to the file instead
+/// of buffering it in memory).
 async fn read_contents(
     server: ServerExtractor,
     Query(query): Query<ContentsQuery>,
 ) -> AppResult<Response> {
-    let bytes = server.fs.read(&query.file)?;
+    let (file, size) = server.fs.open_read(&query.file)?;
     let filename = query
         .file
         .rsplit('/')
@@ -78,21 +80,22 @@ async fn read_contents(
         .unwrap_or("file")
         .to_string();
 
-    let mut resp = bytes.into_response();
     let mime = mime_for_name(&filename);
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(mime),
-    );
-    resp.headers_mut().insert("X-Mime-Type", HeaderValue::from_static(mime));
+    let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from(file));
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
+        .header("X-Mime-Type", HeaderValue::from_static(mime))
+        .header(header::CONTENT_LENGTH, HeaderValue::from(size));
     if query.download.is_some() {
-        resp.headers_mut().insert(
+        builder = builder.header(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
                 .unwrap_or(HeaderValue::from_static("attachment")),
         );
     }
-    Ok(resp)
+    builder
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot build response: {e}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +137,18 @@ async fn copy_file(
     server: ServerExtractor,
     Json(payload): Json<LocationRequest>,
 ) -> AppResult<Response> {
+    // Wings checks the copied file's size against the disk limit before
+    // copying (filesystem.go Copy → HasSpaceFor).
+    let stat = server.fs.stat(std::path::Path::new(&payload.location))?;
+    let limit = server.config.read().await.build.disk_space;
+    if limit > 0 && !stat.directory {
+        let used = server.disk_usage_cached().await;
+        if used + stat.size.unsigned_abs() > (limit as u64) * 1024 * 1024 {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "not enough disk space to copy this file"
+            )));
+        }
+    }
     let stat = server.fs.copy(&payload.location)?;
     Ok(JsonValue(json!(stat)).into_response())
 }

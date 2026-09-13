@@ -279,21 +279,21 @@ async fn post_server_transfer(
     }
     server.set_transferring(true);
 
-    // Ensure the server is offline before archiving its data.
-    if *server.state.read().await != crate::server::ServerState::Offline {
-        if let Err(e) = server.power_stop(15).await {
-            server.set_transferring(false);
-            return Err(e);
-        }
-        if *server.state.read().await != crate::server::ServerState::Offline {
-            let _ = server.power_kill().await;
-        }
-    }
-
     let (url, token) = (payload.url, payload.token);
     let task_server = server.0.clone();
     let panel = state.panel.clone();
     let handle = tokio::spawn(async move {
+        // Wings runs the whole transfer in the background (the route returns
+        // 202 immediately): stop the server inside the task too, so a slow
+        // stop never blocks the HTTP response.
+        if *task_server.state.read().await != crate::server::ServerState::Offline {
+            if let Err(e) = task_server.power_stop(15).await {
+                tracing::warn!(uuid = %task_server.uuid, error = %e, "failed to stop server for transfer");
+            }
+            if *task_server.state.read().await != crate::server::ServerState::Offline {
+                let _ = task_server.power_kill().await;
+            }
+        }
         let result = push_archive_to_target(&task_server, &url, &token).await;
         match result {
             Ok(()) => {
@@ -434,50 +434,57 @@ async fn push_archive_to_target(
     };
 
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(&archive_path).await.map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("cannot open archive: {e}"))
-    })?;
-    let stream = futures_util::stream::try_unfold(file, move |mut f| {
-        let sent_stream = sent.clone();
-        async move {
-            let mut buf = vec![0u8; 65536];
-            let n = f.read(&mut buf).await.map_err(std::io::Error::from)?;
-            if n == 0 {
-                Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
-            } else {
-                buf.truncate(n);
-                sent_stream.fetch_add(n as u64, Ordering::SeqCst);
-                Ok(Some((bytes::Bytes::from(buf), f)))
+    let result: crate::error::AppResult<()> = async {
+        let file = tokio::fs::File::open(&archive_path).await.map_err(|e| {
+            AppError::Internal(anyhow::anyhow!("cannot open archive: {e}"))
+        })?;
+        let stream = futures_util::stream::try_unfold(file, move |mut f| {
+            let sent_stream = sent.clone();
+            async move {
+                let mut buf = vec![0u8; 65536];
+                let n = f.read(&mut buf).await.map_err(std::io::Error::from)?;
+                if n == 0 {
+                    Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
+                } else {
+                    buf.truncate(n);
+                    sent_stream.fetch_add(n as u64, Ordering::SeqCst);
+                    Ok(Some((bytes::Bytes::from(buf), f)))
+                }
             }
-        }
-    });
-    let part = reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream))
-        .file_name("archive.tar.gz")
-        .mime_str("application/gzip")
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("bad mime: {e}")))?;
-    let checksum_part = reqwest::multipart::Part::text(checksum);
-    let form = reqwest::multipart::Form::new()
-        .part("archive", part)
-        .part("checksum", checksum_part);
+        });
+        let part = reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream))
+            .file_name("archive.tar.gz")
+            .mime_str("application/gzip")
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("bad mime: {e}")))?;
+        let checksum_part = reqwest::multipart::Part::text(checksum);
+        let form = reqwest::multipart::Form::new()
+            .part("archive", part)
+            .part("checksum", checksum_part);
 
-    let client = reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot build http client: {e}")))?;
-    let resp = client
-        .post(url)
-        .header("Authorization", token)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot reach destination: {e}")))?;
-    progress_task.abort();
-    if !resp.status().is_success() {
-        return Err(AppError::Internal(anyhow::anyhow!(
-            "unexpected status code from destination: {}",
-            resp.status()
-        )));
+        let client = reqwest::Client::builder()
+            .http1_only()
+            .build()
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot build http client: {e}")))?;
+        let resp = client
+            .post(url)
+            .header("Authorization", token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("cannot reach destination: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "unexpected status code from destination: {}",
+                resp.status()
+            )));
+        }
+        Ok(())
     }
+    .await;
+    // The ticker must be aborted on every path — a failed upload would
+    // otherwise keep publishing "Uploading [...]" forever.
+    progress_task.abort();
+    result?;
 
     transfer_log(server, "Finished streaming archive to destination.");
     Ok(())

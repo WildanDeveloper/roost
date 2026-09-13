@@ -113,9 +113,14 @@ async fn handle_socket(
     let mut authenticated: Option<Authed> = None;
     let mut first_auth_done = false;
     let mut events_rx: Option<tokio::sync::broadcast::Receiver<crate::server::events::ServerEvent>> = None;
+    // Persistent receiver: events published while this task is busy
+    // processing a message or awaiting socket.send() stay buffered instead
+    // of being dropped by a fresh resubscribe on every select iteration.
+    let mut rx: Option<tokio::sync::broadcast::Receiver<crate::server::events::ServerEvent>> = None;
     let mut rate = RateLimiter::new(10, Duration::from_millis(200));
     let mut throttled_sent = false;
     let mut expired_sent = false;
+    let mut expiring_sent = false;
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -123,9 +128,11 @@ async fn handle_socket(
 
     loop {
         let subscribed = events_rx.is_some();
+        if events_rx.is_some() && rx.is_none() {
+            rx = Some(events_rx.as_ref().unwrap().resubscribe());
+        }
         let event_fut = async {
-            let mut rx = events_rx.as_ref().unwrap().resubscribe();
-            rx.recv().await
+            rx.as_mut().expect("subscribed").recv().await
         };
 
         tokio::select! {
@@ -139,8 +146,16 @@ async fn handle_socket(
                             ws_send!(&mut socket, "token expired", Vec::<String>::new());
                             expired_sent = true;
                         }
+                        expiring_sent = true;
                     } else if exp - now <= 60 {
-                        ws_send!(&mut socket, "token expiring", Vec::<String>::new());
+                        if !expiring_sent {
+                            ws_send!(&mut socket, "token expiring", Vec::<String>::new());
+                            expiring_sent = true;
+                        }
+                        expired_sent = false;
+                    } else {
+                        expired_sent = false;
+                        expiring_sent = false;
                     }
                 }
             }

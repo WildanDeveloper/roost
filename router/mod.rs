@@ -41,4 +41,9 @@ pub fn build(state: DaemonState) -> Router {
         .merge(protected)
         .layer(from_fn_with_state(state.clone(), middleware::cors))
         .layer(axum::middleware::from_fn(middleware::request_id))
+        // Wings (gin) applies no global request-body limit: file writes and
+        // incoming transfers carry real payloads (hundreds of MB). The
+        // upload endpoint enforces `api.upload_limit` on its own; disable
+        // the axum default (2 MiB) so parity holds.
+        .layer(axum::extract::DefaultBodyLimit::disable())
 }
